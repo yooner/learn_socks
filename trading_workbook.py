@@ -47,12 +47,13 @@ TRADE_HEADERS = [
     "期望止损比例",
     "盈亏比",
     "实际盈亏金额",
-    "实际收益率",
-    "与平均盈利比例差值",
+    "单笔仓位收益率",
+    "账户收益率与平均盈利率差值",
     "持有天数",
     "复利容许平均亏损上限",
     "复利风险判断",
     "交易打分评价",
+    "实际账户收益率",
 ]
 
 REASON_HEADERS = [
@@ -156,6 +157,30 @@ def calculate_return_rate(
     return pnl / invested
 
 
+def calculate_account_return(
+    pnl: float,
+    account_snapshot: float,
+) -> float | None:
+    """Calculate one trade's realized contribution to total account equity."""
+    if account_snapshot <= 0:
+        return None
+    return pnl / account_snapshot
+
+
+def calculate_compound_return(
+    account_returns: Iterable[float | None],
+) -> float | None:
+    """Compound actual account returns in transaction order."""
+    factor = 1.0
+    count = 0
+    for account_return in account_returns:
+        if account_return is None:
+            continue
+        factor *= 1 + account_return
+        count += 1
+    return factor - 1 if count else None
+
+
 def calculate_open_theoretical_loss(
     trades: Iterable[Mapping[str, Any]],
 ) -> float:
@@ -217,14 +242,14 @@ def summarize_trades(
     win_rate = len(wins) / decisive_count if decisive_count else None
     loss_rate = len(losses) / decisive_count if decisive_count else None
     average_win = _average(
-        trade["return_rate"]
+        trade["account_return"]
         for trade in wins
-        if trade.get("return_rate") is not None
+        if trade.get("account_return") is not None
     )
     average_loss = _average(
-        abs(trade["return_rate"])
+        abs(trade["account_return"])
         for trade in losses
-        if trade.get("return_rate") is not None
+        if trade.get("account_return") is not None
     )
     expectancy = None
     if (
@@ -235,11 +260,9 @@ def summarize_trades(
     ):
         expectancy = win_rate * average_win - loss_rate * average_loss
 
-    compound_return = None
-    if wins or losses:
-        win_factor = (1 + (average_win or 0)) ** len(wins)
-        loss_factor = (1 - (average_loss or 0)) ** len(losses)
-        compound_return = win_factor * loss_factor - 1
+    compound_return = calculate_compound_return(
+        trade.get("account_return") for trade in closed
+    )
 
     return {
         "completed_count": len(closed),
@@ -383,7 +406,7 @@ def _style_trade_sheet(ws, end_row: int) -> None:
             cell.alignment = Alignment(vertical="top", wrap_text=True)
         for column in (3, 5, 10, 11, 14, 15, 16, 24):
             ws.cell(row, column).number_format = CURRENCY_FORMAT
-        for column in (4, 21, 22, 25, 26, 28):
+        for column in (4, 21, 22, 25, 26, 28, 31):
             ws.cell(row, column).number_format = PERCENT_FORMAT
         for column in (9, 13):
             ws.cell(row, column).number_format = "yyyy-mm-dd"
@@ -407,6 +430,7 @@ def _style_trade_sheet(ws, end_row: int) -> None:
         "复利容许平均亏损上限": 22,
         "复利风险判断": 18,
         "交易打分评价": 18,
+        "实际账户收益率": 18,
     }
     for column, header in enumerate(TRADE_HEADERS, start=1):
         ws.column_dimensions[get_column_letter(column)].width = (
@@ -478,8 +502,8 @@ def _add_trade_formulas(ws, end_row: int) -> None:
             row,
             26,
             (
-                f'=IF(OR(Y{row}="",\'多次统计数据\'!$B$8=""),"",'
-                f"Y{row}-'多次统计数据'!$B$8)"
+                f'=IF(OR(AE{row}="",\'多次统计数据\'!$B$8=""),"",'
+                f"AE{row}-'多次统计数据'!$B$8)"
             ),
         )
         ws.cell(
@@ -507,6 +531,11 @@ def _add_trade_formulas(ws, end_row: int) -> None:
                 f'IF(\'多次统计数据\'!$B$9<AB{row},"低于上限",'
                 f'"达到或超过上限"))'
             ),
+        )
+        ws.cell(
+            row,
+            31,
+            f'=IF(OR(X{row}="",C{row}="",C{row}<=0),"",X{row}/C{row})',
         )
 
 
@@ -607,6 +636,14 @@ def _add_trade_conditional_formatting(ws, end_row: int) -> None:
         CellIsRule(operator="lessThan", formula=["0"], fill=RED_FILL),
     )
     ws.conditional_formatting.add(
+        f"AE2:AE{end_row}",
+        CellIsRule(operator="greaterThan", formula=["0"], fill=GREEN_FILL),
+    )
+    ws.conditional_formatting.add(
+        f"AE2:AE{end_row}",
+        CellIsRule(operator="lessThan", formula=["0"], fill=RED_FILL),
+    )
+    ws.conditional_formatting.add(
         f"G2:G{end_row}",
         FormulaRule(formula=['$G2="禁止开仓"'], fill=RED_FILL),
     )
@@ -623,7 +660,7 @@ def _build_trade_sheet(wb: Workbook, end_row: int = 201):
     _style_trade_sheet(ws, end_row)
     _add_trade_validations(ws, end_row)
     _add_trade_conditional_formatting(ws, end_row)
-    _add_table(ws, "TradeRecords", f"A1:AD{end_row}")
+    _add_table(ws, "TradeRecords", f"A1:AE{end_row}")
     ws["C1"].comment = Comment(
         "开仓时从“账户数据”的当前总金额复制，并粘贴为数值；不要保留公式。",
         "Codex",
@@ -646,6 +683,10 @@ def _build_trade_sheet(wb: Workbook, end_row: int = 201):
     )
     ws["L1"].comment = Comment(
         "默认等于实际买入股数；本系统按一次卖出处理。",
+        "Codex",
+    )
+    ws["AE1"].comment = Comment(
+        "实际盈亏金额÷买入时账户金额快照；用于账户口径统计与逐笔复利。",
         "Codex",
     )
     return ws
@@ -751,13 +792,13 @@ def _build_statistics_sheet(wb: Workbook):
         ("亏损概率", '=IFERROR(B4/(B3+B4),"")', "亏损数÷胜负交易数"),
         (
             "平均盈利百分比",
-            '=IFERROR(AVERAGEIF(\'单次交易\'!X2:X201,">0",\'单次交易\'!Y2:Y201),"")',
-            "盈利交易实际收益率的平均值",
+            '=IFERROR(AVERAGEIF(\'单次交易\'!X2:X201,">0",\'单次交易\'!AE2:AE201),"")',
+            "盈利交易实际账户收益率的平均值",
         ),
         (
             "平均亏损百分比",
-            '=IFERROR(-AVERAGEIF(\'单次交易\'!X2:X201,"<0",\'单次交易\'!Y2:Y201),"")',
-            "以正数显示亏损幅度",
+            '=IFERROR(-AVERAGEIF(\'单次交易\'!X2:X201,"<0",\'单次交易\'!AE2:AE201),"")',
+            "亏损交易实际账户收益率绝对值的平均值",
         ),
         (
             "盈利的持有总天数",
@@ -777,8 +818,9 @@ def _build_statistics_sheet(wb: Workbook):
         ("期望收益率", '=IF(OR(B6="",B7="",B8="",B9=""),"",B6*B8-B7*B9)', "盈利贡献减亏损贡献"),
         (
             "迄今为止的复利净利润率",
-            '=IF(OR(B3+B4=0,B8="",B9=""),"",POWER(1+B8,B3)*POWER(1-B9,B4)-1)',
-            "基于历史平均盈亏率的几何复利模拟",
+            '=IF(COUNT(\'单次交易\'!AE2:AE201)=0,"",'
+            'EXP(SUMPRODUCT(IFERROR(LN(1+\'单次交易\'!AE2:AE201),0)))-1)',
+            "按每笔实际账户收益率逐笔连乘",
         ),
     ]
     for row in rows:
@@ -828,17 +870,22 @@ def _build_account_sheet(wb: Workbook):
             '=IF(OR(B7="",B9=""),"",B7-B9)',
             "当月允许最大亏损金额－当前未平仓理论亏损",
         ),
+        (
+            "账户实际累计收益率",
+            '=IF(OR(B2="",B3="",B2<=0),"",B3/B2-1)',
+            "当前总金额÷初始总金额－1；无入金出金时为账户权威累计收益",
+        ),
     ]
     for row in rows:
         ws.append(row)
     _style_panel(ws)
     for cell in ("B2", "B4", "B6"):
         ws[cell].fill = INPUT_FILL
-    for cell in ("B3", "B5", "B7", "B8", "B9", "B10"):
+    for cell in ("B3", "B5", "B7", "B8", "B9", "B10", "B11"):
         ws[cell].fill = FORMULA_FILL
     for cell in ("B2", "B3", "B5", "B7", "B8", "B9", "B10"):
         ws[cell].number_format = CURRENCY_FORMAT
-    for cell in ("B4", "B6"):
+    for cell in ("B4", "B6", "B11"):
         ws[cell].number_format = PERCENT_FORMAT
     positive_amount = DataValidation(
         type="decimal",
@@ -877,8 +924,8 @@ def _build_target_sheet(wb: Workbook):
         ("历史期望收益率", "='多次统计数据'!B13", "来自历史胜率与平均盈亏"),
         (
             "所需投资笔数",
-            '=IF(OR(B4="",B5="",B6="",B5<=0,B6<=0),"暂不可计算",ROUNDUP(B4/(B5*B6),0))',
-            "向上取整；历史期望收益率不为正时不计算",
+            '=IF(OR(B3="",B6="",B3<=0,B6<=0),"暂不可计算",ROUNDUP(LN(1+B3)/LN(1+B6),0))',
+            "按目标收益率与历史账户期望收益率复利计算并向上取整",
         ),
     ]
     for row in rows:
@@ -1056,6 +1103,7 @@ def sample_trade_metrics(as_of_date: date) -> list[dict[str, Any]]:
         shares = item["actual_buy_shares"]
         pnl = None
         return_rate = None
+        account_return = None
         hold_days = None
         if (
             shares is not None
@@ -1076,11 +1124,17 @@ def sample_trade_metrics(as_of_date: date) -> list[dict[str, Any]]:
                 shares,
                 item["buy_fee"],
             )
+            account_return = calculate_account_return(
+                pnl,
+                item["account_snapshot"],
+            )
             hold_days = (item["sell_date"] - item["buy_date"]).days
         result.append(
             {
                 "pnl": pnl,
                 "return_rate": return_rate,
+                "account_return": account_return,
+                "account_snapshot": item["account_snapshot"],
                 "hold_days": hold_days,
                 "trade_amount": (
                     item["buy_price"] * shares

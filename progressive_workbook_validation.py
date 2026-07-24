@@ -21,6 +21,7 @@ def _metric_record(item: Mapping[str, Any]) -> dict[str, Any]:
     shares = item["actual_buy_shares"]
     pnl = None
     return_rate = None
+    account_return = None
     hold_days = None
     if (
         shares is not None
@@ -41,10 +42,16 @@ def _metric_record(item: Mapping[str, Any]) -> dict[str, Any]:
             shares,
             item["buy_fee"],
         )
+        account_return = tw.calculate_account_return(
+            pnl,
+            item["account_snapshot"],
+        )
         hold_days = (item["sell_date"] - item["buy_date"]).days
     return {
         "pnl": pnl,
         "return_rate": return_rate,
+        "account_return": account_return,
+        "account_snapshot": item["account_snapshot"],
         "hold_days": hold_days,
         "trade_amount": (
             item["buy_price"] * shares if shares is not None else None
@@ -166,12 +173,24 @@ def _inspect_step(
             trade.cell(row, 24).value,
             current_metric["pnl"],
         ),
+        "account return": (
+            trade.cell(row, 31).value,
+            current_metric["account_return"],
+        ),
         "risk status": (trade.cell(row, 7).value, expected_status),
         "completed count": (stats["B2"].value, summary["completed_count"]),
         "win count": (stats["B3"].value, summary["win_count"]),
         "loss count": (stats["B4"].value, summary["loss_count"]),
         "flat count": (stats["B5"].value, summary["flat_count"]),
         "current balance": (account["B3"].value, current_balance),
+        "trade-by-trade compound return": (
+            stats["B14"].value,
+            summary["compound_return"],
+        ),
+        "actual cumulative account return": (
+            account["B11"].value,
+            current_balance / 100_000 - 1,
+        ),
         "monthly realized loss": (
             account["B8"].value,
             tw.calculate_monthly_loss(metrics, as_of_date),
@@ -294,6 +313,8 @@ def _write_report(
             "",
             "- 买入建议股数按账户快照、风险比例和止损距离计算，并向下取整至100股。",
             "- 实际买入股数独立手填；实际盈亏、收益率和平均交易金额均引用实际股数。",
+            "- 单笔仓位收益率用于交易复盘；实际账户收益率按买入时账户快照计算。",
+            "- 统计页逐笔复利与账户页实际累计收益率在顺序样本中逐步核对一致。",
             "- 买入理由的三个技术指标字段引用“技术指标”命名区域。",
             "- 当前未平仓理论亏损仅统计未卖出且已有实际股数的持仓。",
             "- 候选交易尚未填写实际股数时，告警会额外计入其建议仓位风险。",

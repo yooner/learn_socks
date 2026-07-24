@@ -100,7 +100,10 @@ self.assertEqual(
     '=IF(OR(X2="",C2="",C2<=0),"",X2/C2)',
 )
 self.assertIn("'单次交易'!AE2:AE201", stats["B8"].value)
-self.assertIn("PRODUCT(1+'单次交易'!AE2:AE201)", stats["B14"].value)
+self.assertIn(
+    "SUMPRODUCT(IFERROR(LN(1+'单次交易'!AE2:AE201),0))",
+    stats["B14"].value,
+)
 ```
 
 - [ ] **Step 2: Run the structure test and verify RED**
@@ -121,10 +124,11 @@ Expected: the `AE` column and account-return statistics are absent.
 - Expand `TradeRecords` from `A:AD` to `A:AE`.
 - Format and conditionally color `AE` as a percentage.
 - Change statistics `B8:B9` to average `AE`.
-- Change `B14` to:
+- Change `B14` to the logarithmic equivalent of a product, which avoids range implicit intersection in Excel and LibreOffice:
 
 ```excel
-=IF(COUNT('单次交易'!AE2:AE201)=0,"",PRODUCT(1+'单次交易'!AE2:AE201)-1)
+=IF(COUNT('单次交易'!AE2:AE201)=0,"",
+ EXP(SUMPRODUCT(IFERROR(LN(1+'单次交易'!AE2:AE201),0)))-1)
 ```
 
 - [ ] **Step 4: Run structure tests and verify GREEN**
@@ -250,4 +254,3 @@ git add trading_workbook.py progressive_workbook_validation.py tests/test_tradin
 git commit -m "feat: calculate compounding from account returns"
 git push origin main
 ```
-

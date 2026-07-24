@@ -10,6 +10,8 @@ from pathlib import Path
 from openpyxl import load_workbook
 import trading_workbook as tw
 from trading_workbook import (
+    calculate_account_return,
+    calculate_compound_return,
     calculate_compound_loss_ceiling,
     calculate_monthly_loss,
     calculate_position_size,
@@ -53,12 +55,13 @@ TRADE_HEADERS = [
     "期望止损比例",
     "盈亏比",
     "实际盈亏金额",
-    "实际收益率",
-    "与平均盈利比例差值",
+    "单笔仓位收益率",
+    "账户收益率与平均盈利率差值",
     "持有天数",
     "复利容许平均亏损上限",
     "复利风险判断",
     "交易打分评价",
+    "实际账户收益率",
 ]
 
 
@@ -121,11 +124,29 @@ class CalculationTests(unittest.TestCase):
             990 / 10_005,
         )
 
+    def test_account_return_uses_pre_trade_total_equity(self):
+        self.assertEqual(calculate_account_return(1_000, 100_000), 0.01)
+        self.assertAlmostEqual(
+            calculate_account_return(-2_500, 101_000),
+            -2_500 / 101_000,
+        )
+        self.assertIsNone(calculate_account_return(100, 0))
+        self.assertIsNone(calculate_account_return(100, -1))
+
+    def test_compound_return_multiplies_actual_account_returns(self):
+        account_returns = [0.01, -2_500 / 101_000]
+        self.assertAlmostEqual(
+            calculate_compound_return(account_returns),
+            -0.015,
+        )
+        self.assertIsNone(calculate_compound_return([None]))
+
     def test_summary_uses_only_closed_non_flat_trades_for_win_rate(self):
         trades = [
             {
                 "pnl": 990,
                 "return_rate": 990 / 10_005,
+                "account_return": 990 / 100_000,
                 "hold_days": 5,
                 "trade_amount": 10_000,
                 "sell_date": date(2026, 5, 10),
@@ -133,6 +154,7 @@ class CalculationTests(unittest.TestCase):
             {
                 "pnl": -1_210,
                 "return_rate": -1_210 / 20_005,
+                "account_return": -1_210 / 100_990,
                 "hold_days": 3,
                 "trade_amount": 20_000,
                 "sell_date": date(2026, 6, 4),
@@ -140,6 +162,7 @@ class CalculationTests(unittest.TestCase):
             {
                 "pnl": 1_790,
                 "return_rate": 1_790 / 15_005,
+                "account_return": 1_790 / 99_780,
                 "hold_days": 8,
                 "trade_amount": 15_000,
                 "sell_date": date(2026, 6, 18),
@@ -147,6 +170,7 @@ class CalculationTests(unittest.TestCase):
             {
                 "pnl": -732,
                 "return_rate": -732 / 18_006,
+                "account_return": -732 / 101_570,
                 "hold_days": 2,
                 "trade_amount": 18_000,
                 "sell_date": date(2026, 7, 3),
@@ -154,6 +178,7 @@ class CalculationTests(unittest.TestCase):
             {
                 "pnl": 0,
                 "return_rate": 0,
+                "account_return": 0,
                 "hold_days": 1,
                 "trade_amount": 18_000,
                 "sell_date": date(2026, 7, 6),
@@ -161,6 +186,7 @@ class CalculationTests(unittest.TestCase):
             {
                 "pnl": None,
                 "return_rate": None,
+                "account_return": None,
                 "hold_days": None,
                 "trade_amount": 20_000,
                 "sell_date": None,
@@ -179,11 +205,11 @@ class CalculationTests(unittest.TestCase):
         self.assertEqual(result["loss_rate"], 0.5)
         self.assertAlmostEqual(
             result["average_win"],
-            ((990 / 10_005) + (1_790 / 15_005)) / 2,
+            ((990 / 100_000) + (1_790 / 99_780)) / 2,
         )
         self.assertAlmostEqual(
             result["average_loss"],
-            ((1_210 / 20_005) + (732 / 18_006)) / 2,
+            ((1_210 / 100_990) + (732 / 101_570)) / 2,
         )
         self.assertGreater(result["average_loss"], 0)
         expected_expectancy = (
@@ -191,10 +217,14 @@ class CalculationTests(unittest.TestCase):
             - result["loss_rate"] * result["average_loss"]
         )
         self.assertAlmostEqual(result["expectancy"], expected_expectancy)
-        expected_compound = (
-            (1 + result["average_win"]) ** result["win_count"]
-            * (1 - result["average_loss"]) ** result["loss_count"]
-            - 1
+        expected_compound = calculate_compound_return(
+            [
+                990 / 100_000,
+                -1_210 / 100_990,
+                1_790 / 99_780,
+                -732 / 101_570,
+                0,
+            ]
         )
         self.assertAlmostEqual(result["compound_return"], expected_compound)
         self.assertAlmostEqual(
@@ -332,9 +362,11 @@ class WorkbookStructureTests(unittest.TestCase):
     def test_trade_sheet_contains_required_headers_and_guarded_formulas(self):
         ws = self.workbook["单次交易"]
         self.assertEqual(
-            [ws.cell(1, column).value for column in range(1, 31)],
+            [ws.cell(1, column).value for column in range(1, 32)],
             TRADE_HEADERS,
         )
+        self.assertEqual(ws["Y1"].value, "单笔仓位收益率")
+        self.assertEqual(ws["AE1"].value, "实际账户收益率")
         self.assertIn("ROUNDDOWN", ws["F2"].value)
         self.assertIn("IF(OR(", ws["F2"].value)
         self.assertIn("'账户数据'!$B$9", ws["G2"].value)
@@ -350,6 +382,11 @@ class WorkbookStructureTests(unittest.TestCase):
         self.assertIn('OR(A2=""', ws["AB2"].value)
         self.assertIn("'多次统计数据'!$B$8", ws["AB2"].value)
         self.assertIn("'多次统计数据'!$B$9", ws["AC2"].value)
+        self.assertEqual(
+            ws["AE2"].value,
+            '=IF(OR(X2="",C2="",C2<=0),"",X2/C2)',
+        )
+        self.assertIn("AE2", ws["Z2"].value)
 
     def test_input_and_formula_cells_use_distinct_fills(self):
         ws = self.workbook["单次交易"]
@@ -359,6 +396,7 @@ class WorkbookStructureTests(unittest.TestCase):
         self.assertEqual(ws["G2"].fill.fgColor.rgb, "00E7E6E6")
         self.assertEqual(ws["H2"].fill.fgColor.rgb, "00DDEBF7")
         self.assertEqual(ws["X2"].fill.fgColor.rgb, "00E7E6E6")
+        self.assertEqual(ws["AE2"].fill.fgColor.rgb, "00E7E6E6")
 
     def test_trade_and_reason_logs_are_filterable_and_frozen(self):
         trade = self.workbook["单次交易"]
@@ -396,8 +434,17 @@ class WorkbookStructureTests(unittest.TestCase):
         target = self.workbook["目标收益"]
         self.assertIn("COUNTIF", stats["B3"].value)
         self.assertIn("-AVERAGEIF", stats["B9"].value)
+        self.assertIn("'单次交易'!AE2:AE201", stats["B8"].value)
+        self.assertIn("'单次交易'!AE2:AE201", stats["B9"].value)
         self.assertIn("B6*B8-B7*B9", stats["B13"].value)
-        self.assertIn("POWER(1+B8,B3)", stats["B14"].value)
+        self.assertIn(
+            "SUMPRODUCT(IFERROR(LN(1+'单次交易'!AE2:AE201),0))",
+            stats["B14"].value,
+        )
+        self.assertNotIn(
+            "PRODUCT(1+'单次交易'!AE2:AE201)",
+            stats["B14"].value,
+        )
         self.assertIn("'单次交易'!E2:E201", stats["B12"].value)
         self.assertIn("'单次交易'!H2:H201", stats["B12"].value)
         self.assertNotIn("'单次交易'!F2:F201", stats["B12"].value)
@@ -414,8 +461,15 @@ class WorkbookStructureTests(unittest.TestCase):
             account["B10"].value,
             '=IF(OR(B7="",B9=""),"",B7-B9)',
         )
+        self.assertEqual(account["A11"].value, "账户实际累计收益率")
+        self.assertEqual(
+            account["B11"].value,
+            '=IF(OR(B2="",B3="",B2<=0),"",B3/B2-1)',
+        )
         self.assertIn('"暂不可计算"', target["B7"].value)
         self.assertIn("ROUNDUP", target["B7"].value)
+        self.assertIn("LN(1+B3)/LN(1+B6)", target["B7"].value)
+        self.assertNotIn("B5*B6", target["B7"].value)
 
     def test_workbook_has_validations_risk_formatting_and_auto_calculation(self):
         trade = self.workbook["单次交易"]
@@ -423,6 +477,7 @@ class WorkbookStructureTests(unittest.TestCase):
         self.assertEqual(trade["U2"].number_format, "0.00%")
         self.assertEqual(trade["I2"].number_format, "yyyy-mm-dd")
         self.assertEqual(trade["X2"].number_format, '¥#,##0.00;[Red]-¥#,##0.00')
+        self.assertEqual(trade["AE2"].number_format, "0.00%")
         self.assertEqual(self.workbook.calculation.calcMode, "auto")
         self.assertTrue(self.workbook.calculation.fullCalcOnLoad)
         self.assertTrue(self.workbook.calculation.forceFullCalc)
@@ -512,7 +567,25 @@ class IntegrationTests(unittest.TestCase):
                         trade.cell(row, 24).value,
                         metric["pnl"],
                     )
-            for column in (6, 7, 12, 21, 22, 23, 24, 25, 26, 27, 28, 29):
+                    self.assertAlmostEqual(
+                        trade.cell(row, 31).value,
+                        metric["account_return"],
+                    )
+            for column in (
+                6,
+                7,
+                12,
+                21,
+                22,
+                23,
+                24,
+                25,
+                26,
+                27,
+                28,
+                29,
+                31,
+            ):
                 self.assertIsNone(
                     trade.cell(102, column).value,
                     msg=f"blank row formula column {column} must stay blank",
@@ -545,6 +618,14 @@ class IntegrationTests(unittest.TestCase):
                 if trade["pnl"] is not None
             )
             self.assertAlmostEqual(account["B3"].value, current_balance)
+            self.assertAlmostEqual(
+                account["B11"].value,
+                current_balance / 100_000 - 1,
+            )
+            self.assertAlmostEqual(
+                stats["B14"].value,
+                account["B11"].value,
+            )
             expected_monthly_loss = calculate_monthly_loss(
                 expected_trades,
                 self.AS_OF_DATE,
@@ -578,10 +659,8 @@ class IntegrationTests(unittest.TestCase):
             self.assertEqual(expected_status, "禁止开仓")
             self.assertAlmostEqual(target["B2"].value, current_balance)
             self.assertAlmostEqual(target["B4"].value, current_balance * 0.10)
-            expected_count = calculate_required_trades(
-                current_balance * 0.10,
-                summary["average_trade_amount"],
-                summary["expectancy"],
+            expected_count = math.ceil(
+                math.log1p(0.10) / math.log1p(summary["expectancy"])
             )
             self.assertEqual(target["B7"].value, expected_count)
 
