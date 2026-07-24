@@ -2,6 +2,7 @@ import math
 import unittest
 from datetime import date
 
+import trading_workbook as tw
 from trading_workbook import (
     calculate_compound_loss_ceiling,
     calculate_monthly_loss,
@@ -11,6 +12,45 @@ from trading_workbook import (
     calculate_return_rate,
     summarize_trades,
 )
+
+EXPECTED_SHEETS = [
+    "单次交易",
+    "买入理由",
+    "多次统计数据",
+    "账户数据",
+    "目标收益",
+]
+
+TRADE_HEADERS = [
+    "交易编号",
+    "股票代码",
+    "买入时账户金额",
+    "本次允许亏损比例",
+    "买入价",
+    "买入股数",
+    "买入日期",
+    "期望卖出价",
+    "实际卖出价",
+    "卖出股数",
+    "卖出日期",
+    "止损价",
+    "买入费用",
+    "卖出费用",
+    "买入价的由来",
+    "止损价的由来",
+    "期望卖出价的由来",
+    "实际卖出价的由来",
+    "期望盈利比例",
+    "期望止损比例",
+    "盈亏比",
+    "实际盈亏金额",
+    "实际收益率",
+    "与平均盈利比例差值",
+    "持有天数",
+    "复利容许平均亏损上限",
+    "复利风险判断",
+    "交易打分评价",
+]
 
 
 class CalculationTests(unittest.TestCase):
@@ -180,6 +220,68 @@ class CalculationTests(unittest.TestCase):
         self.assertIsNone(calculate_required_trades(1_000, 0, 0.025))
         self.assertIsNone(calculate_required_trades(1_000, 10_000, 0))
         self.assertIsNone(calculate_required_trades(1_000, 10_000, -0.01))
+
+
+class WorkbookStructureTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.workbook = tw.build_workbook(with_sample_data=False)
+
+    def test_workbook_has_exactly_the_five_agreed_sheets(self):
+        self.assertEqual(self.workbook.sheetnames, EXPECTED_SHEETS)
+
+    def test_trade_sheet_contains_required_headers_and_guarded_formulas(self):
+        ws = self.workbook["单次交易"]
+        self.assertEqual(
+            [ws.cell(1, column).value for column in range(1, 29)],
+            TRADE_HEADERS,
+        )
+        self.assertIn("ROUNDDOWN", ws["F2"].value)
+        self.assertIn("IF(OR(", ws["F2"].value)
+        self.assertEqual(ws["J2"].value, '=IF(I2="","",F2)')
+        self.assertIn("'多次统计数据'!$B$8", ws["Z2"].value)
+        self.assertIn("'多次统计数据'!$B$9", ws["AA2"].value)
+
+    def test_input_and_formula_cells_use_distinct_fills(self):
+        ws = self.workbook["单次交易"]
+        self.assertEqual(ws["C2"].fill.fgColor.rgb, "00DDEBF7")
+        self.assertEqual(ws["D2"].fill.fgColor.rgb, "00DDEBF7")
+        self.assertEqual(ws["F2"].fill.fgColor.rgb, "00E7E6E6")
+        self.assertEqual(ws["V2"].fill.fgColor.rgb, "00E7E6E6")
+
+    def test_trade_and_reason_logs_are_filterable_and_frozen(self):
+        trade = self.workbook["单次交易"]
+        reasons = self.workbook["买入理由"]
+        self.assertEqual(trade.freeze_panes, "A2")
+        self.assertEqual(reasons.freeze_panes, "A2")
+        self.assertEqual(len(trade.tables), 1)
+        self.assertEqual(len(reasons.tables), 1)
+        self.assertGreater(len(trade.data_validations.dataValidation), 5)
+        self.assertGreater(len(reasons.data_validations.dataValidation), 1)
+
+    def test_statistics_account_and_target_formulas_follow_metric_contract(self):
+        stats = self.workbook["多次统计数据"]
+        account = self.workbook["账户数据"]
+        target = self.workbook["目标收益"]
+        self.assertIn("COUNTIF", stats["B3"].value)
+        self.assertIn("-AVERAGEIF", stats["B9"].value)
+        self.assertIn("B6*B8-B7*B9", stats["B13"].value)
+        self.assertIn("POWER(1+B8,B3)", stats["B14"].value)
+        self.assertIn("SUM('单次交易'!V2:V201)", account["B3"].value)
+        self.assertIn("SUMIFS", account["B8"].value)
+        self.assertIn("EOMONTH(TODAY()", account["B8"].value)
+        self.assertIn('"暂不可计算"', target["B7"].value)
+        self.assertIn("ROUNDUP", target["B7"].value)
+
+    def test_workbook_has_validations_risk_formatting_and_auto_calculation(self):
+        trade = self.workbook["单次交易"]
+        self.assertGreater(len(trade.conditional_formatting), 3)
+        self.assertEqual(trade["S2"].number_format, "0.00%")
+        self.assertEqual(trade["G2"].number_format, "yyyy-mm-dd")
+        self.assertEqual(trade["V2"].number_format, '¥#,##0.00;[Red]-¥#,##0.00')
+        self.assertEqual(self.workbook.calculation.calcMode, "auto")
+        self.assertTrue(self.workbook.calculation.fullCalcOnLoad)
+        self.assertTrue(self.workbook.calculation.forceFullCalc)
 
 
 if __name__ == "__main__":
