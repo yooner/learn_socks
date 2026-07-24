@@ -247,6 +247,8 @@ class WorkbookStructureTests(unittest.TestCase):
         self.assertIn('IF(M2="",0,M2)', ws["V2"].value)
         self.assertIn('IF(N2="",0,N2)', ws["V2"].value)
         self.assertNotIn("{row}", ws["V2"].value)
+        self.assertIn('IF(OR(V2="",E2="",F2=""),"",IF(', ws["W2"].value)
+        self.assertIn('OR(A2=""', ws["Z2"].value)
         self.assertIn("'多次统计数据'!$B$8", ws["Z2"].value)
         self.assertIn("'多次统计数据'!$B$9", ws["AA2"].value)
 
@@ -360,6 +362,11 @@ class IntegrationTests(unittest.TestCase):
                     self.assertIsNone(trade.cell(row, 22).value)
                 else:
                     self.assertAlmostEqual(trade.cell(row, 22).value, expected)
+            for column in (6, 10, 19, 20, 21, 22, 23, 24, 25, 26, 27):
+                self.assertIsNone(
+                    trade.cell(8, column).value,
+                    msg=f"blank row formula column {column} must stay blank",
+                )
 
             expected_trades = tw.sample_trade_metrics(self.AS_OF_DATE)
             summary = summarize_trades(expected_trades)
@@ -415,6 +422,15 @@ class IntegrationTests(unittest.TestCase):
             self.assertIsNone(clean_wb["单次交易"]["A2"].value)
             self.assertEqual(sample_wb["单次交易"]["A2"].value, "T2026001")
             self.assertEqual(sample_wb["买入理由"]["D2"].value, "买入")
+
+    def test_main_writes_deliverables_to_requested_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = tw.main(
+                output_dir=temporary,
+                as_of_date=self.AS_OF_DATE,
+            )
+            self.assertEqual(len(paths), 2)
+            self.assertTrue(all(path.exists() for path in paths))
 
 
 if __name__ == "__main__":

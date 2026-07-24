@@ -387,9 +387,9 @@ def _add_trade_formulas(ws, end_row: int) -> None:
             row,
             23,
             (
-                f'=IF(OR(V{row}="",E{row}="",F{row}="",'
-                f"E{row}*F{row}+IF(M{row}=\"\",0,M{row})<=0),\"\","
-                f"V{row}/(E{row}*F{row}+IF(M{row}=\"\",0,M{row})))"
+                f'=IF(OR(V{row}="",E{row}="",F{row}=""),"",'
+                f'IF(E{row}*F{row}+IF(M{row}="",0,M{row})<=0,"",'
+                f'V{row}/(E{row}*F{row}+IF(M{row}="",0,M{row}))))'
             ),
         )
         ws.cell(
@@ -409,7 +409,7 @@ def _add_trade_formulas(ws, end_row: int) -> None:
             row,
             26,
             (
-                "=IF(OR('多次统计数据'!$B$8=\"\","
+                f'=IF(OR(A{row}="",\'多次统计数据\'!$B$8="",'
                 "'多次统计数据'!$B$6<=0,"
                 "'多次统计数据'!$B$6>=1),\"\","
                 "1-POWER(1+'多次统计数据'!$B$8,"
@@ -964,3 +964,18 @@ def write_workbooks(
         as_of_date=effective_date,
     ).save(sample_path)
     return clean_path, sample_path
+
+
+def main(
+    output_dir: str | Path = ".",
+    as_of_date: date | None = None,
+) -> tuple[Path, Path]:
+    """Generate both user-facing workbook deliverables."""
+    paths = write_workbooks(output_dir, as_of_date=as_of_date)
+    for path in paths:
+        print(path)
+    return paths
+
+
+if __name__ == "__main__":
+    main()
