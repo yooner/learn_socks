@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import math
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from openpyxl import Workbook
 from openpyxl.comments import Comment
+from openpyxl.workbook.defined_name import DefinedName
 from openpyxl.formatting.rule import CellIsRule, FormulaRule
 from openpyxl.styles import (
     Alignment,
@@ -27,7 +28,9 @@ TRADE_HEADERS = [
     "买入时账户金额",
     "本次允许亏损比例",
     "买入价",
-    "买入股数",
+    "买入建议股数",
+    "开仓风险告警",
+    "实际买入股数",
     "买入日期",
     "期望卖出价",
     "实际卖出价",
@@ -62,6 +65,29 @@ REASON_HEADERS = [
     "技术指标2",
     "技术指标3",
     "综述",
+]
+
+TECHNICAL_INDICATORS = [
+    ("蜡烛图", "价格形态", "观察实体、上下影线及组合形态"),
+    ("趋势线", "趋势", "连接关键高点或低点判断趋势方向"),
+    ("MACD", "动量", "观察快慢线、信号线和柱状图"),
+    ("移动平均线", "趋势", "观察价格与不同周期均线的位置关系"),
+    ("成交量", "量价", "确认突破、回调和趋势的参与强度"),
+    ("RSI", "动量", "衡量相对强弱及超买超卖状态"),
+    ("KDJ", "动量", "观察随机指标交叉和极值区域"),
+    ("布林带", "波动", "观察价格相对中轨和上下轨的位置"),
+    ("支撑位", "关键价位", "记录预期获得买盘支撑的价格区域"),
+    ("压力位", "关键价位", "记录预期遇到卖压的价格区域"),
+    ("缺口", "价格形态", "观察跳空缺口是否回补或延续"),
+    ("形态突破", "价格形态", "观察平台、箱体或整理形态的突破"),
+    ("均线金叉", "趋势", "短周期均线上穿长周期均线"),
+    ("均线死叉", "趋势", "短周期均线下穿长周期均线"),
+    ("量价背离", "量价", "价格和成交量变化方向不一致"),
+    ("趋势背离", "动量", "价格走势与动量指标走势不一致"),
+    ("ATR", "波动", "衡量真实波动幅度并辅助设置止损"),
+    ("换手率", "量价", "衡量筹码交换活跃程度"),
+    ("相对强弱", "比较", "比较个股与板块或指数的强弱"),
+    ("板块共振", "市场环境", "确认个股信号与所属板块方向一致"),
 ]
 
 HEADER_FILL = PatternFill("solid", fgColor="1F4E78")
@@ -128,6 +154,43 @@ def calculate_return_rate(
     if invested <= 0:
         return None
     return pnl / invested
+
+
+def calculate_open_theoretical_loss(
+    trades: Iterable[Mapping[str, Any]],
+) -> float:
+    """Return stop-loss exposure for positions without a sell date."""
+    total = 0.0
+    for trade in trades:
+        if trade.get("sell_date") is not None:
+            continue
+        buy_price = trade.get("buy_price")
+        stop_price = trade.get("stop_price")
+        actual_shares = trade.get("actual_buy_shares")
+        if (
+            buy_price is None
+            or stop_price is None
+            or actual_shares is None
+            or actual_shares <= 0
+        ):
+            continue
+        loss_per_share = float(buy_price) - float(stop_price)
+        if loss_per_share > 0:
+            total += loss_per_share * int(actual_shares)
+    return total
+
+
+def calculate_opening_risk_status(
+    open_risk: float,
+    candidate_risk: float,
+    monthly_limit: float | None,
+) -> str | None:
+    """Return whether a candidate position fits inside the monthly risk limit."""
+    if monthly_limit is None or monthly_limit <= 0:
+        return None
+    if open_risk + candidate_risk >= monthly_limit:
+        return "禁止开仓"
+    return "允许开仓"
 
 
 def _average(values: Iterable[float]) -> float | None:
@@ -296,18 +359,19 @@ def _style_trade_sheet(ws, end_row: int) -> None:
         3,
         4,
         5,
-        7,
         8,
         9,
+        10,
         11,
-        12,
         13,
         14,
         15,
         16,
         17,
         18,
-        28,
+        19,
+        20,
+        30,
     }
     for row in range(2, end_row + 1):
         for column in range(1, len(TRADE_HEADERS) + 1):
@@ -317,20 +381,23 @@ def _style_trade_sheet(ws, end_row: int) -> None:
             )
             cell.border = THIN_BORDER
             cell.alignment = Alignment(vertical="top", wrap_text=True)
-        for column in (3, 5, 8, 9, 12, 13, 14, 22):
+        for column in (3, 5, 10, 11, 14, 15, 16, 24):
             ws.cell(row, column).number_format = CURRENCY_FORMAT
-        for column in (4, 19, 20, 23, 24, 26):
+        for column in (4, 21, 22, 25, 26, 28):
             ws.cell(row, column).number_format = PERCENT_FORMAT
-        for column in (7, 11):
+        for column in (9, 13):
             ws.cell(row, column).number_format = "yyyy-mm-dd"
-        ws.cell(row, 21).number_format = "0.00"
-        ws.cell(row, 25).number_format = "0"
+        ws.cell(row, 23).number_format = "0.00"
+        ws.cell(row, 27).number_format = "0"
 
     width_by_header = {
         "交易编号": 14,
         "股票代码": 14,
         "买入时账户金额": 17,
         "本次允许亏损比例": 18,
+        "买入建议股数": 16,
+        "开仓风险告警": 16,
+        "实际买入股数": 16,
         "买入日期": 13,
         "卖出日期": 13,
         "买入价的由来": 24,
@@ -353,61 +420,76 @@ def _add_trade_formulas(ws, end_row: int) -> None:
             row,
             6,
             (
-                f'=IF(OR(C{row}="",D{row}="",E{row}="",L{row}="",'
-                f"C{row}<=0,D{row}<=0,E{row}<=L{row}),"
-                f'"",ROUNDDOWN((C{row}*D{row})/(E{row}-L{row})/100,0)*100)'
+                f'=IF(OR(C{row}="",D{row}="",E{row}="",N{row}="",'
+                f"C{row}<=0,D{row}<=0,E{row}<=N{row}),"
+                f'"",ROUNDDOWN((C{row}*D{row})/(E{row}-N{row})/100,0)*100)'
             ),
         )
-        ws.cell(row, 10, f'=IF(I{row}="","",F{row})')
         ws.cell(
             row,
-            19,
-            f'=IF(OR(E{row}="",H{row}="",E{row}<=0),"",(H{row}-E{row})/E{row})',
+            7,
+            (
+                f'=IF(OR(A{row}="",F{row}="",E{row}="",N{row}="",'
+                f"E{row}<=N{row},'账户数据'!$B$7=\"\"),\"\","
+                f"IF('账户数据'!$B$9+IF(H{row}=\"\","
+                f"F{row}*(E{row}-N{row}),0)>='账户数据'!$B$7,"
+                '"禁止开仓","允许开仓"))'
+            ),
         )
         ws.cell(
             row,
-            20,
-            f'=IF(OR(E{row}="",L{row}="",E{row}<=0),"",(E{row}-L{row})/E{row})',
+            12,
+            f'=IF(K{row}="","",H{row})',
         )
         ws.cell(
             row,
             21,
-            f'=IF(OR(S{row}="",T{row}="",T{row}<=0),"",S{row}/T{row})',
+            f'=IF(OR(E{row}="",J{row}="",E{row}<=0),"",(J{row}-E{row})/E{row})',
         )
         ws.cell(
             row,
             22,
-            (
-                f'=IF(OR(I{row}="",J{row}="",E{row}="",F{row}=""),"",'
-                f'I{row}*J{row}-E{row}*F{row}-IF(M{row}="",0,M{row})'
-                f'-IF(N{row}="",0,N{row}))'
-            ),
+            f'=IF(OR(E{row}="",N{row}="",E{row}<=0),"",(E{row}-N{row})/E{row})',
         )
         ws.cell(
             row,
             23,
-            (
-                f'=IF(OR(V{row}="",E{row}="",F{row}=""),"",'
-                f'IF(E{row}*F{row}+IF(M{row}="",0,M{row})<=0,"",'
-                f'V{row}/(E{row}*F{row}+IF(M{row}="",0,M{row}))))'
-            ),
+            f'=IF(OR(U{row}="",V{row}="",V{row}<=0),"",U{row}/V{row})',
         )
         ws.cell(
             row,
             24,
             (
-                f'=IF(OR(W{row}="",\'多次统计数据\'!$B$8=""),"",'
-                f"W{row}-'多次统计数据'!$B$8)"
+                f'=IF(OR(K{row}="",L{row}="",E{row}="",H{row}=""),"",'
+                f'K{row}*L{row}-E{row}*H{row}-IF(O{row}="",0,O{row})'
+                f'-IF(P{row}="",0,P{row}))'
             ),
         )
         ws.cell(
             row,
             25,
-            f'=IF(OR(G{row}="",K{row}="",K{row}<G{row}),"",K{row}-G{row})',
+            (
+                f'=IF(OR(X{row}="",E{row}="",H{row}=""),"",'
+                f'IF(E{row}*H{row}+IF(O{row}="",0,O{row})<=0,"",'
+                f'X{row}/(E{row}*H{row}+IF(O{row}="",0,O{row}))))'
+            ),
         )
         ws.cell(
             row,
             26,
+            (
+                f'=IF(OR(Y{row}="",\'多次统计数据\'!$B$8=""),"",'
+                f"Y{row}-'多次统计数据'!$B$8)"
+            ),
+        )
+        ws.cell(
+            row,
+            27,
+            f'=IF(OR(I{row}="",M{row}="",M{row}<I{row}),"",M{row}-I{row})',
+        )
+        ws.cell(
+            row,
+            28,
             (
                 f'=IF(OR(A{row}="",\'多次统计数据\'!$B$8="",'
                 "'多次统计数据'!$B$6<=0,"
@@ -419,10 +501,10 @@ def _add_trade_formulas(ws, end_row: int) -> None:
         )
         ws.cell(
             row,
-            27,
+            29,
             (
-                f'=IF(OR(Z{row}="",\'多次统计数据\'!$B$9=""),"",'
-                f'IF(\'多次统计数据\'!$B$9<Z{row},"低于上限",'
+                f'=IF(OR(AB{row}="",\'多次统计数据\'!$B$9=""),"",'
+                f'IF(\'多次统计数据\'!$B$9<AB{row},"低于上限",'
                 f'"达到或超过上限"))'
             ),
         )
@@ -438,7 +520,7 @@ def _add_trade_validations(ws, end_row: int) -> None:
     _add_validation(
         ws,
         positive_decimal,
-        f"C2:C{end_row} E2:E{end_row} H2:I{end_row} L2:L{end_row}",
+        f"C2:C{end_row} E2:E{end_row} J2:K{end_row} N2:N{end_row}",
     )
     risk_rate = DataValidation(
         type="decimal",
@@ -454,7 +536,16 @@ def _add_trade_validations(ws, end_row: int) -> None:
         formula1="0",
         allow_blank=True,
     )
-    _add_validation(ws, nonnegative_fee, f"M2:N{end_row}")
+    _add_validation(ws, nonnegative_fee, f"O2:P{end_row}")
+    actual_shares = DataValidation(
+        type="custom",
+        formula1='=OR(H2="",AND(ISNUMBER(H2),H2>0,MOD(H2,100)=0))',
+        allow_blank=True,
+    )
+    actual_shares.error = "实际买入股数必须是大于0的100股整数倍"
+    actual_shares.errorTitle = "实际买入股数无效"
+    actual_shares.showErrorMessage = True
+    _add_validation(ws, actual_shares, f"H2:H{end_row}")
     buy_date = DataValidation(
         type="date",
         operator="between",
@@ -462,58 +553,66 @@ def _add_trade_validations(ws, end_row: int) -> None:
         formula2="DATE(2100,12,31)",
         allow_blank=True,
     )
-    _add_validation(ws, buy_date, f"G2:G{end_row}")
+    _add_validation(ws, buy_date, f"I2:I{end_row}")
     sell_date = DataValidation(
         type="custom",
-        formula1='=OR(K2="",AND(ISNUMBER(K2),K2>=G2))',
+        formula1='=OR(M2="",AND(ISNUMBER(M2),M2>=I2))',
         allow_blank=True,
     )
-    _add_validation(ws, sell_date, f"K2:K{end_row}")
+    _add_validation(ws, sell_date, f"M2:M{end_row}")
     sell_shares = DataValidation(
         type="custom",
-        formula1='=OR(J2="",J2=F2)',
+        formula1='=OR(L2="",L2=H2)',
         allow_blank=True,
     )
-    _add_validation(ws, sell_shares, f"J2:J{end_row}")
+    _add_validation(ws, sell_shares, f"L2:L{end_row}")
     score = DataValidation(
         type="list",
         formula1='"1-差,2-较差,3-一般,4-良好,5-优秀"',
         allow_blank=True,
     )
-    _add_validation(ws, score, f"AB2:AB{end_row}")
+    _add_validation(ws, score, f"AD2:AD{end_row}")
 
 
 def _add_trade_conditional_formatting(ws, end_row: int) -> None:
     ws.conditional_formatting.add(
-        f"V2:V{end_row}",
+        f"X2:X{end_row}",
         CellIsRule(operator="greaterThan", formula=["0"], fill=GREEN_FILL),
     )
     ws.conditional_formatting.add(
-        f"V2:V{end_row}",
+        f"X2:X{end_row}",
         CellIsRule(operator="lessThan", formula=["0"], fill=RED_FILL),
     )
     ws.conditional_formatting.add(
-        f"U2:U{end_row}",
+        f"W2:W{end_row}",
         CellIsRule(operator="lessThan", formula=["2"], fill=YELLOW_FILL),
     )
     ws.conditional_formatting.add(
-        f"AA2:AA{end_row}",
+        f"AC2:AC{end_row}",
         FormulaRule(
-            formula=['$AA2="达到或超过上限"'],
+            formula=['$AC2="达到或超过上限"'],
             fill=RED_FILL,
         ),
     )
     ws.conditional_formatting.add(
-        f"AA2:AA{end_row}",
-        FormulaRule(formula=['$AA2="低于上限"'], fill=GREEN_FILL),
+        f"AC2:AC{end_row}",
+        FormulaRule(formula=['$AC2="低于上限"'], fill=GREEN_FILL),
     )
     ws.conditional_formatting.add(
-        f"X2:X{end_row}",
+        f"Y2:Y{end_row}",
         CellIsRule(operator="greaterThan", formula=["0"], fill=GREEN_FILL),
     )
     ws.conditional_formatting.add(
-        f"X2:X{end_row}",
+        f"Y2:Y{end_row}",
         CellIsRule(operator="lessThan", formula=["0"], fill=RED_FILL),
+    )
+    ws.conditional_formatting.add(
+        f"G2:G{end_row}",
+        FormulaRule(formula=['$G2="禁止开仓"'], fill=RED_FILL),
+    )
+    ws.conditional_formatting.add(
+        f"G2:G{end_row}",
+        FormulaRule(formula=['$G2="允许开仓"'], fill=GREEN_FILL),
     )
 
 
@@ -524,7 +623,7 @@ def _build_trade_sheet(wb: Workbook, end_row: int = 201):
     _style_trade_sheet(ws, end_row)
     _add_trade_validations(ws, end_row)
     _add_trade_conditional_formatting(ws, end_row)
-    _add_table(ws, "TradeRecords", f"A1:AB{end_row}")
+    _add_table(ws, "TradeRecords", f"A1:AD{end_row}")
     ws["C1"].comment = Comment(
         "开仓时从“账户数据”的当前总金额复制，并粘贴为数值；不要保留公式。",
         "Codex",
@@ -533,8 +632,20 @@ def _build_trade_sheet(wb: Workbook, end_row: int = 201):
         "开仓时从“账户数据”的单次交易允许亏损比例复制，并粘贴为数值。",
         "Codex",
     )
-    ws["J1"].comment = Comment(
-        "默认等于买入股数；本系统按一次卖出处理。",
+    ws["F1"].comment = Comment(
+        "按账户快照、本次风险比例和止损距离计算；仅作仓位建议。",
+        "Codex",
+    )
+    ws["G1"].comment = Comment(
+        "比较全部未平仓理论亏损（含本行拟开仓风险）与当月允许最大亏损金额。",
+        "Codex",
+    )
+    ws["H1"].comment = Comment(
+        "手动填写实际成交股数；后续盈亏、收益率和统计均引用此列。",
+        "Codex",
+    )
+    ws["L1"].comment = Comment(
+        "默认等于实际买入股数；本系统按一次卖出处理。",
         "Codex",
     )
     return ws
@@ -567,7 +678,45 @@ def _build_reason_sheet(wb: Workbook, end_row: int = 501):
         allow_blank=True,
     )
     _add_validation(ws, log_date, f"E2:E{end_row}")
+    indicator = DataValidation(
+        type="list",
+        formula1="=技术指标列表",
+        allow_blank=True,
+    )
+    indicator.error = "请从“技术指标”工作表维护的列表中选择"
+    indicator.errorTitle = "技术指标无效"
+    indicator.showErrorMessage = True
+    _add_validation(ws, indicator, f"F2:H{end_row}")
     _add_table(ws, "TradeReasonLog", f"A1:I{end_row}")
+    return ws
+
+
+def _build_technical_indicator_sheet(wb: Workbook, end_row: int = 201):
+    ws = wb.create_sheet("技术指标")
+    _apply_header(ws, ["技术指标", "分类", "说明"])
+    for row, values in enumerate(TECHNICAL_INDICATORS, start=2):
+        for column, value in enumerate(values, start=1):
+            ws.cell(row, column).value = value
+    for row in range(2, end_row + 1):
+        for column in range(1, 4):
+            cell = ws.cell(row, column)
+            cell.fill = INPUT_FILL
+            cell.border = THIN_BORDER
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+    ws.column_dimensions["A"].width = 22
+    ws.column_dimensions["B"].width = 18
+    ws.column_dimensions["C"].width = 56
+    _add_table(ws, "TechnicalIndicatorCatalog", f"A1:C{end_row}")
+    wb.defined_names.add(
+        DefinedName(
+            "技术指标列表",
+            attr_text=f"'技术指标'!$A$2:$A${end_row}",
+        )
+    )
+    ws["A1"].comment = Comment(
+        "可在本列继续添加或修改指标；买入理由页的三个下拉框会引用A2:A201。",
+        "Codex",
+    )
     return ws
 
 
@@ -590,40 +739,40 @@ def _build_statistics_sheet(wb: Workbook):
     ws = wb.create_sheet("多次统计数据")
     rows = [
         ("指标", "当前统计", "口径说明"),
-        ("已完成交易数", "=COUNT('单次交易'!K2:K201)", "存在卖出日期的交易"),
-        ("盈利交易数", '=COUNTIF(\'单次交易\'!V2:V201,">0")', "实际盈亏金额大于0"),
-        ("亏损交易数", '=COUNTIF(\'单次交易\'!V2:V201,"<0")', "实际盈亏金额小于0"),
+        ("已完成交易数", "=COUNT('单次交易'!M2:M201)", "存在卖出日期的交易"),
+        ("盈利交易数", '=COUNTIF(\'单次交易\'!X2:X201,">0")', "实际盈亏金额大于0"),
+        ("亏损交易数", '=COUNTIF(\'单次交易\'!X2:X201,"<0")', "实际盈亏金额小于0"),
         (
             "持平交易数",
-            '=COUNTIFS(\'单次交易\'!K2:K201,"<>",\'单次交易\'!V2:V201,"=0")',
+            '=COUNTIFS(\'单次交易\'!M2:M201,"<>",\'单次交易\'!X2:X201,"=0")',
             "已卖出且实际盈亏为0；不进入胜负样本",
         ),
         ("盈利概率", '=IFERROR(B3/(B3+B4),"")', "盈利数÷胜负交易数"),
         ("亏损概率", '=IFERROR(B4/(B3+B4),"")', "亏损数÷胜负交易数"),
         (
             "平均盈利百分比",
-            '=IFERROR(AVERAGEIF(\'单次交易\'!V2:V201,">0",\'单次交易\'!W2:W201),"")',
+            '=IFERROR(AVERAGEIF(\'单次交易\'!X2:X201,">0",\'单次交易\'!Y2:Y201),"")',
             "盈利交易实际收益率的平均值",
         ),
         (
             "平均亏损百分比",
-            '=IFERROR(-AVERAGEIF(\'单次交易\'!V2:V201,"<0",\'单次交易\'!W2:W201),"")',
+            '=IFERROR(-AVERAGEIF(\'单次交易\'!X2:X201,"<0",\'单次交易\'!Y2:Y201),"")',
             "以正数显示亏损幅度",
         ),
         (
             "盈利的持有总天数",
-            '=SUMIF(\'单次交易\'!V2:V201,">0",\'单次交易\'!Y2:Y201)',
+            '=SUMIF(\'单次交易\'!X2:X201,">0",\'单次交易\'!AA2:AA201)',
             "自然日",
         ),
         (
             "亏损的持有总天数",
-            '=SUMIF(\'单次交易\'!V2:V201,"<0",\'单次交易\'!Y2:Y201)',
+            '=SUMIF(\'单次交易\'!X2:X201,"<0",\'单次交易\'!AA2:AA201)',
             "自然日",
         ),
         (
             "平均交易金额",
-            '=IFERROR(SUMPRODUCT(\'单次交易\'!E2:E201,\'单次交易\'!F2:F201)/COUNT(\'单次交易\'!E2:E201),"")',
-            "全部已填写买入价交易的平均买入金额，包含未卖出交易",
+            '=IFERROR(SUMPRODUCT(\'单次交易\'!E2:E201,\'单次交易\'!H2:H201)/COUNT(\'单次交易\'!H2:H201),"")',
+            "买入价×实际买入股数的平均值，包含未卖出交易",
         ),
         ("期望收益率", '=IF(OR(B6="",B7="",B8="",B9=""),"",B6*B8-B7*B9)', "盈利贡献减亏损贡献"),
         (
@@ -651,19 +800,33 @@ def _build_account_sheet(wb: Workbook):
         ("初始总金额", None, "手动输入；当前金额从此值开始累计"),
         (
             "当前总金额",
-            "=IF(B2=\"\",\"\",B2+SUM('单次交易'!V2:V201))",
+            "=IF(B2=\"\",\"\",B2+SUM('单次交易'!X2:X201))",
             "初始总金额＋全部已实现盈亏",
         ),
         ("单次交易允许的亏损比例", 0.01, "默认1%，可调整；开仓时复制为交易快照"),
         ("单次交易允许的亏损金额", '=IF(B3="","",B3*B4)', "当前总金额×单次允许亏损比例"),
-        ("累计交易允许的亏损比例", 0.05, "默认5%，可调整"),
-        ("累计交易允许的亏损总金额", '=IF(B3="","",B3*B6)', "当前总金额×累计允许亏损比例"),
+        ("当月允许最大亏损比例", 0.05, "默认5%，可调整"),
+        ("当月允许最大亏损金额", '=IF(B3="","",B3*B6)', "当前总金额×当月最大亏损比例"),
         (
             "当月亏损金额",
-            '=SUMIFS(\'单次交易\'!V2:V201,\'单次交易\'!V2:V201,"<0",'
-            '\'单次交易\'!K2:K201,">="&EOMONTH(TODAY(),-1)+1,'
-            '\'单次交易\'!K2:K201,"<="&EOMONTH(TODAY(),0))',
+            '=SUMIFS(\'单次交易\'!X2:X201,\'单次交易\'!X2:X201,"<0",'
+            '\'单次交易\'!M2:M201,">="&EOMONTH(TODAY(),-1)+1,'
+            '\'单次交易\'!M2:M201,"<="&EOMONTH(TODAY(),0))',
             "按卖出日期统计本月已实现亏损，保留负号",
+        ),
+        (
+            "当前未平仓理论亏损",
+            '=IFERROR(SUMPRODUCT((\'单次交易\'!M2:M201="")*'
+            '(\'单次交易\'!H2:H201>0)*'
+            '(\'单次交易\'!E2:E201>\'单次交易\'!N2:N201)*'
+            '\'单次交易\'!H2:H201*'
+            '(\'单次交易\'!E2:E201-\'单次交易\'!N2:N201)),0)',
+            "未填写卖出日期的实际持仓×买入价与止损价之差",
+        ),
+        (
+            "当月剩余可开仓风险额度",
+            '=IF(OR(B7="",B9=""),"",B7-B9)',
+            "当月允许最大亏损金额－当前未平仓理论亏损",
         ),
     ]
     for row in rows:
@@ -671,9 +834,9 @@ def _build_account_sheet(wb: Workbook):
     _style_panel(ws)
     for cell in ("B2", "B4", "B6"):
         ws[cell].fill = INPUT_FILL
-    for cell in ("B3", "B5", "B7", "B8"):
+    for cell in ("B3", "B5", "B7", "B8", "B9", "B10"):
         ws[cell].fill = FORMULA_FILL
-    for cell in ("B2", "B3", "B5", "B7", "B8"):
+    for cell in ("B2", "B3", "B5", "B7", "B8", "B9", "B10"):
         ws[cell].number_format = CURRENCY_FORMAT
     for cell in ("B4", "B6"):
         ws[cell].number_format = PERCENT_FORMAT
@@ -694,6 +857,10 @@ def _build_account_sheet(wb: Workbook):
     _add_validation(ws, risk_rates, "B4 B6")
     ws.conditional_formatting.add(
         "B8",
+        CellIsRule(operator="lessThan", formula=["0"], fill=RED_FILL),
+    )
+    ws.conditional_formatting.add(
+        "B10",
         CellIsRule(operator="lessThan", formula=["0"], fill=RED_FILL),
     )
     return ws
@@ -734,121 +901,167 @@ def _build_target_sheet(wb: Workbook):
     return ws
 
 
-def _sample_transaction_inputs(as_of_date: date) -> list[dict[str, Any]]:
-    return [
-        {
-            "trade_id": "T2026001",
-            "stock_code": "600519",
-            "account_snapshot": 100_000,
-            "risk_rate": 0.01,
-            "buy_price": 10,
-            "buy_date": date(2026, 5, 5),
-            "expected_sell_price": 12,
-            "sell_price": 11,
-            "sell_date": date(2026, 5, 10),
-            "stop_price": 9,
-            "buy_fee": 5,
-            "sell_fee": 5,
-            "sources": ("箱体突破回踩", "前低下方", "前高附近", "按计划止盈"),
-            "score": "4-良好",
-        },
-        {
-            "trade_id": "T2026002",
-            "stock_code": "000001",
-            "account_snapshot": 100_990,
-            "risk_rate": 0.01,
-            "buy_price": 20,
-            "buy_date": date(2026, 6, 1),
-            "expected_sell_price": 23,
-            "sell_price": 18.8,
-            "sell_date": date(2026, 6, 4),
-            "stop_price": 19,
-            "buy_fee": 5,
-            "sell_fee": 5,
-            "sources": ("均线企稳", "关键均线下方", "前高", "跌破止损"),
-            "score": "2-较差",
-        },
-        {
-            "trade_id": "T2026003",
-            "stock_code": "300750",
-            "account_snapshot": 99_780,
-            "risk_rate": 0.01,
-            "buy_price": 25,
-            "buy_date": date(2026, 6, 10),
-            "expected_sell_price": 29,
-            "sell_price": 28,
-            "sell_date": date(2026, 6, 18),
-            "stop_price": 23.5,
-            "buy_fee": 5,
-            "sell_fee": 5,
-            "sources": ("放量突破", "突破位下方", "压力区", "分批计划的加权价"),
-            "score": "5-优秀",
-        },
-        {
-            "trade_id": "T2026004",
-            "stock_code": "002594",
-            "account_snapshot": 101_570,
-            "risk_rate": 0.01,
-            "buy_price": 15,
-            "buy_date": date(as_of_date.year, as_of_date.month, 1),
-            "expected_sell_price": 17,
-            "sell_price": 14.4,
-            "sell_date": date(as_of_date.year, as_of_date.month, 3),
-            "stop_price": 14.2,
-            "buy_fee": 6,
-            "sell_fee": 6,
-            "sources": ("支撑位反弹", "支撑下方", "前高", "弱势退出"),
-            "score": "2-较差",
-        },
-        {
-            "trade_id": "T2026005",
-            "stock_code": "601318",
-            "account_snapshot": 100_838,
-            "risk_rate": 0.01,
-            "buy_price": 30,
-            "buy_date": date(as_of_date.year, as_of_date.month, 5),
-            "expected_sell_price": 33,
-            "sell_price": 30,
-            "sell_date": date(as_of_date.year, as_of_date.month, 6),
-            "stop_price": 28.5,
-            "buy_fee": 0,
-            "sell_fee": 0,
-            "sources": ("横盘试仓", "箱体下沿", "箱体上沿", "信号失效持平退出"),
-            "score": "3-一般",
-        },
-        {
-            "trade_id": "T2026006",
-            "stock_code": "688981",
-            "account_snapshot": 100_838,
-            "risk_rate": 0.01,
-            "buy_price": 40,
-            "buy_date": date(as_of_date.year, as_of_date.month, 10),
-            "expected_sell_price": 45,
-            "sell_price": None,
-            "sell_date": None,
-            "stop_price": 38,
-            "buy_fee": 5,
-            "sell_fee": 0,
-            "sources": ("行业趋势转强", "突破位下方", "前高区域", ""),
-            "score": "",
-        },
+def generate_sample_transactions(
+    as_of_date: date,
+    count: int = 100,
+) -> list[dict[str, Any]]:
+    """Generate deterministic trades for progressive workbook verification."""
+    if count < 0 or count > 200:
+        raise ValueError("count must be between 0 and 200")
+
+    stock_codes = [
+        "600519",
+        "000001",
+        "300750",
+        "002594",
+        "601318",
+        "688981",
+        "000858",
+        "600036",
+        "002415",
+        "601899",
     ]
+    sectors = [
+        "消费",
+        "银行",
+        "新能源",
+        "汽车",
+        "保险",
+        "半导体",
+        "食品饮料",
+        "金融",
+        "电子",
+        "资源",
+    ]
+    indicator_names = [item[0] for item in TECHNICAL_INDICATORS]
+    start_date = as_of_date - timedelta(days=count)
+    current_balance = 100_000.0
+    result: list[dict[str, Any]] = []
+
+    for index in range(1, count + 1):
+        cycle = index % 10
+        if index % 25 == 0:
+            outcome = "candidate"
+        elif cycle == 0:
+            outcome = "open"
+        elif cycle in (1, 2, 3, 4):
+            outcome = "win"
+        elif cycle in (5, 6, 7, 8):
+            outcome = "loss"
+        else:
+            outcome = "flat"
+
+        buy_price = round(10 + (index % 11) * 1.25, 2)
+        stop_distance = 0.75 + (index % 4) * 0.25
+        stop_price = round(buy_price - stop_distance, 2)
+        risk_rate = 0.01
+        suggested_shares = calculate_position_size(
+            current_balance,
+            risk_rate,
+            buy_price,
+            stop_price,
+        )
+        if suggested_shares is None or suggested_shares <= 0:
+            raise ValueError("sample inputs must produce a valid position")
+        position_fraction = (0.2, 0.4, 0.6, 0.8, 1.0)[(index - 1) % 5]
+        actual_buy_shares = max(
+            100,
+            math.floor(suggested_shares * position_fraction / 100) * 100,
+        )
+        actual_buy_shares = min(actual_buy_shares, suggested_shares)
+        if outcome == "candidate":
+            actual_buy_shares = None
+
+        buy_date = start_date + timedelta(days=index)
+        sell_date = None
+        sell_price = None
+        buy_fee = 0 if outcome == "flat" else (5 if index % 3 else 0)
+        sell_fee = 0 if outcome == "flat" else (5 if index % 4 else 0)
+        if outcome == "win":
+            sell_price = round(
+                buy_price * (1.12 + (index % 3) * 0.01),
+                2,
+            )
+        elif outcome == "loss":
+            sell_price = round(
+                min(stop_price, buy_price * (0.95 - (index % 2) * 0.01)),
+                2,
+            )
+        elif outcome == "flat":
+            sell_price = buy_price
+        if outcome in {"win", "loss", "flat"}:
+            sell_date = min(
+                buy_date + timedelta(days=1 + index % 7),
+                as_of_date,
+            )
+
+        indicators = tuple(
+            indicator_names[(index - 1 + offset * 5) % len(indicator_names)]
+            for offset in range(3)
+        )
+        score = {
+            "win": "4-良好",
+            "loss": "2-较差",
+            "flat": "3-一般",
+            "open": "",
+            "candidate": "",
+        }[outcome]
+        sources = (
+            f"{indicators[0]}与{indicators[1]}共同确认",
+            f"止损设在{stop_price:.2f}",
+            f"目标参考{indicators[2]}",
+            "按计划成交" if sell_date is not None else "",
+        )
+        item = {
+            "trade_id": f"T{as_of_date.year}{index:03d}",
+            "stock_code": stock_codes[(index - 1) % len(stock_codes)],
+            "sector": sectors[(index - 1) % len(sectors)],
+            "account_snapshot": round(current_balance, 2),
+            "risk_rate": risk_rate,
+            "buy_price": buy_price,
+            "suggested_shares": suggested_shares,
+            "actual_buy_shares": actual_buy_shares,
+            "buy_date": buy_date,
+            "expected_sell_price": round(buy_price * 1.10, 2),
+            "sell_price": sell_price,
+            "sell_date": sell_date,
+            "stop_price": stop_price,
+            "buy_fee": buy_fee,
+            "sell_fee": sell_fee,
+            "sources": sources,
+            "indicators": indicators,
+            "summary": f"{outcome}场景，第{index}笔逐步验证数据",
+            "score": score,
+            "outcome": outcome,
+        }
+        result.append(item)
+
+        if sell_date is not None and actual_buy_shares is not None:
+            current_balance += calculate_realized_pnl(
+                buy_price,
+                actual_buy_shares,
+                sell_price,
+                actual_buy_shares,
+                buy_fee,
+                sell_fee,
+            )
+
+    return result
 
 
 def sample_trade_metrics(as_of_date: date) -> list[dict[str, Any]]:
     """Return the calculation-grain records represented by sample workbook rows."""
     result = []
-    for item in _sample_transaction_inputs(as_of_date):
-        shares = calculate_position_size(
-            item["account_snapshot"],
-            item["risk_rate"],
-            item["buy_price"],
-            item["stop_price"],
-        )
+    for item in generate_sample_transactions(as_of_date):
+        shares = item["actual_buy_shares"]
         pnl = None
         return_rate = None
         hold_days = None
-        if item["sell_price"] is not None and item["sell_date"] is not None:
+        if (
+            shares is not None
+            and item["sell_price"] is not None
+            and item["sell_date"] is not None
+        ):
             pnl = calculate_realized_pnl(
                 item["buy_price"],
                 shares,
@@ -869,70 +1082,89 @@ def sample_trade_metrics(as_of_date: date) -> list[dict[str, Any]]:
                 "pnl": pnl,
                 "return_rate": return_rate,
                 "hold_days": hold_days,
-                "trade_amount": item["buy_price"] * shares,
+                "trade_amount": (
+                    item["buy_price"] * shares
+                    if shares is not None
+                    else None
+                ),
                 "sell_date": item["sell_date"],
+                "buy_price": item["buy_price"],
+                "stop_price": item["stop_price"],
+                "actual_buy_shares": shares,
             }
         )
     return result
 
 
-def _populate_sample_data(wb: Workbook, as_of_date: date) -> None:
+def append_trade_to_workbook(
+    wb: Workbook,
+    item: Mapping[str, Any],
+    row: int,
+) -> None:
+    """Append one trade input record without touching adjacent rows."""
     trade_ws = wb["单次交易"]
-    for row, item in enumerate(
-        _sample_transaction_inputs(as_of_date),
-        start=2,
-    ):
-        values = {
-            1: item["trade_id"],
-            2: item["stock_code"],
-            3: item["account_snapshot"],
-            4: item["risk_rate"],
-            5: item["buy_price"],
-            7: item["buy_date"],
-            8: item["expected_sell_price"],
-            9: item["sell_price"],
-            11: item["sell_date"],
-            12: item["stop_price"],
-            13: item["buy_fee"],
-            14: item["sell_fee"],
-            15: item["sources"][0],
-            16: item["sources"][1],
-            17: item["sources"][2],
-            18: item["sources"][3],
-            28: item["score"],
-        }
-        for column, value in values.items():
-            trade_ws.cell(row, column).value = value
+    values = {
+        1: item["trade_id"],
+        2: item["stock_code"],
+        3: item["account_snapshot"],
+        4: item["risk_rate"],
+        5: item["buy_price"],
+        8: item["actual_buy_shares"],
+        9: item["buy_date"],
+        10: item["expected_sell_price"],
+        11: item["sell_price"],
+        13: item["sell_date"],
+        14: item["stop_price"],
+        15: item["buy_fee"],
+        16: item["sell_fee"],
+        17: item["sources"][0],
+        18: item["sources"][1],
+        19: item["sources"][2],
+        20: item["sources"][3],
+        30: item["score"],
+    }
+    for column, value in values.items():
+        trade_ws.cell(row, column).value = value
 
-    reason_rows = [
-        ("T2026001", "600519", "白酒", "买入", date(2026, 5, 5), "箱体突破", "成交量放大", "板块同步", "回踩后站稳关键位"),
-        ("T2026001", "600519", "白酒", "持续追踪", date(2026, 5, 7), "缩量整理", "支撑未破", "板块稳定", "继续按原计划观察"),
-        ("T2026001", "600519", "白酒", "卖出", date(2026, 5, 10), "接近目标位", "动能减弱", "获利盘增加", "按计划止盈"),
-        ("T2026002", "000001", "银行", "买入", date(2026, 6, 1), "均线企稳", "低位放量", "板块轮动", "尝试右侧确认"),
-        ("T2026002", "000001", "银行", "卖出", date(2026, 6, 4), "跌破均线", "量能放大", "板块转弱", "触发止损退出"),
-        ("T2026003", "300750", "新能源", "买入", date(2026, 6, 10), "放量突破", "趋势向上", "板块共振", "突破有效后买入"),
-        ("T2026003", "300750", "新能源", "持续追踪", date(2026, 6, 14), "回踩不破", "量能健康", "相对强势", "持仓条件仍成立"),
-        ("T2026003", "300750", "新能源", "卖出", date(2026, 6, 18), "接近压力", "涨速放缓", "分歧增加", "按加权成交价记录"),
-        ("T2026004", "002594", "汽车", "买入", date(as_of_date.year, as_of_date.month, 1), "支撑反弹", "下影线", "板块一般", "小仓位验证"),
-        ("T2026004", "002594", "汽车", "卖出", date(as_of_date.year, as_of_date.month, 3), "支撑失效", "收盘跌破", "板块走弱", "执行止损"),
-        ("T2026005", "601318", "保险", "买入", date(as_of_date.year, as_of_date.month, 5), "横盘", "波动收窄", "板块中性", "等待方向选择"),
-        ("T2026005", "601318", "保险", "卖出", date(as_of_date.year, as_of_date.month, 6), "信号消失", "量能不足", "无明显共振", "持平退出"),
-        ("T2026006", "688981", "半导体", "买入", date(as_of_date.year, as_of_date.month, 10), "行业转强", "突破平台", "成交放大", "未卖出，持续追踪"),
-    ]
+
+def append_reason_to_workbook(
+    wb: Workbook,
+    item: Mapping[str, Any],
+    row: int,
+) -> None:
+    """Append one buy-reason input record without touching adjacent rows."""
     reason_ws = wb["买入理由"]
-    for row, values in enumerate(reason_rows, start=2):
-        for column, value in enumerate(values, start=1):
-            reason_ws.cell(row, column).value = value
+    values = (
+        item["trade_id"],
+        item["stock_code"],
+        item["sector"],
+        "买入",
+        item["buy_date"],
+        item["indicators"][0],
+        item["indicators"][1],
+        item["indicators"][2],
+        item["summary"],
+    )
+    for column, value in enumerate(values, start=1):
+        reason_ws.cell(row, column).value = value
 
+
+def _populate_sample_data(wb: Workbook, as_of_date: date) -> None:
     wb["账户数据"]["B2"] = 100_000
     wb["目标收益"]["B3"] = 0.10
+    for row, item in enumerate(
+        generate_sample_transactions(as_of_date),
+        start=2,
+    ):
+        append_trade_to_workbook(wb, item, row)
+        append_reason_to_workbook(wb, item, row)
 
 
 def build_workbook(
     with_sample_data: bool = False,
     as_of_date: date | None = None,
 ) -> Workbook:
-    """Build the five-sheet trading workbook."""
+    """Build the six-sheet trading workbook."""
     wb = Workbook()
     wb.remove(wb.active)
     _build_trade_sheet(wb)
@@ -940,6 +1172,7 @@ def build_workbook(
     _build_statistics_sheet(wb)
     _build_account_sheet(wb)
     _build_target_sheet(wb)
+    _build_technical_indicator_sheet(wb)
     wb.calculation.calcMode = "auto"
     wb.calculation.fullCalcOnLoad = True
     wb.calculation.forceFullCalc = True

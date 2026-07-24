@@ -1,4 +1,5 @@
 import math
+import importlib
 import shutil
 import subprocess
 import tempfile
@@ -24,6 +25,7 @@ EXPECTED_SHEETS = [
     "多次统计数据",
     "账户数据",
     "目标收益",
+    "技术指标",
 ]
 
 TRADE_HEADERS = [
@@ -32,7 +34,9 @@ TRADE_HEADERS = [
     "买入时账户金额",
     "本次允许亏损比例",
     "买入价",
-    "买入股数",
+    "买入建议股数",
+    "开仓风险告警",
+    "实际买入股数",
     "买入日期",
     "期望卖出价",
     "实际卖出价",
@@ -226,38 +230,135 @@ class CalculationTests(unittest.TestCase):
         self.assertIsNone(calculate_required_trades(1_000, 10_000, 0))
         self.assertIsNone(calculate_required_trades(1_000, 10_000, -0.01))
 
+    def test_sample_generator_produces_100_diverse_sequential_trades(self):
+        items = tw.generate_sample_transactions(
+            as_of_date=date(2026, 7, 24),
+            count=100,
+        )
+        self.assertEqual(len(items), 100)
+        self.assertEqual(len({item["trade_id"] for item in items}), 100)
+        self.assertTrue(any(item["sell_date"] is None for item in items))
+        self.assertTrue(any(item["actual_buy_shares"] is None for item in items))
+        self.assertTrue(
+            any(
+                item["actual_buy_shares"] is not None
+                and item["actual_buy_shares"] < item["suggested_shares"]
+                for item in items
+            )
+        )
+        outcomes = {item["outcome"] for item in items}
+        self.assertEqual(outcomes, {"win", "loss", "flat", "open", "candidate"})
+        indicators = {
+            indicator
+            for item in items
+            for indicator in item["indicators"]
+        }
+        self.assertIn("蜡烛图", indicators)
+        self.assertIn("趋势线", indicators)
+        self.assertIn("MACD", indicators)
+        sample_summary = summarize_trades(
+            tw.sample_trade_metrics(date(2026, 7, 24))
+        )
+        self.assertGreater(sample_summary["expectancy"], 0)
+
+    def test_append_trade_writes_only_one_requested_row(self):
+        workbook = tw.build_workbook(with_sample_data=False)
+        item = tw.generate_sample_transactions(
+            as_of_date=date(2026, 7, 24),
+            count=1,
+        )[0]
+
+        tw.append_trade_to_workbook(workbook, item, row=2)
+        tw.append_reason_to_workbook(workbook, item, row=2)
+
+        trade = workbook["单次交易"]
+        reasons = workbook["买入理由"]
+        self.assertEqual(trade["A2"].value, item["trade_id"])
+        self.assertEqual(trade["H2"].value, item["actual_buy_shares"])
+        self.assertIsNone(trade["A3"].value)
+        self.assertEqual(reasons["A2"].value, item["trade_id"])
+        self.assertEqual(reasons["F2"].value, item["indicators"][0])
+        self.assertIsNone(reasons["A3"].value)
+
+    def test_open_risk_uses_only_unsold_actual_shares(self):
+        trades = [
+            {
+                "buy_price": 10,
+                "stop_price": 9,
+                "actual_buy_shares": 500,
+                "sell_date": None,
+            },
+            {
+                "buy_price": 20,
+                "stop_price": 18,
+                "actual_buy_shares": 200,
+                "sell_date": date(2026, 7, 20),
+            },
+            {
+                "buy_price": 30,
+                "stop_price": 31,
+                "actual_buy_shares": 300,
+                "sell_date": None,
+            },
+        ]
+        self.assertEqual(tw.calculate_open_theoretical_loss(trades), 500)
+
+    def test_risk_status_includes_candidate_at_inclusive_limit(self):
+        self.assertEqual(
+            tw.calculate_opening_risk_status(4_100, 900, 5_000),
+            "禁止开仓",
+        )
+        self.assertEqual(
+            tw.calculate_opening_risk_status(4_000, 900, 5_000),
+            "允许开仓",
+        )
+        self.assertEqual(
+            tw.calculate_opening_risk_status(5_100, 0, 5_000),
+            "禁止开仓",
+        )
+        self.assertIsNone(
+            tw.calculate_opening_risk_status(0, 0, None),
+        )
+
 
 class WorkbookStructureTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.workbook = tw.build_workbook(with_sample_data=False)
 
-    def test_workbook_has_exactly_the_five_agreed_sheets(self):
+    def test_workbook_has_the_six_agreed_sheets(self):
         self.assertEqual(self.workbook.sheetnames, EXPECTED_SHEETS)
 
     def test_trade_sheet_contains_required_headers_and_guarded_formulas(self):
         ws = self.workbook["单次交易"]
         self.assertEqual(
-            [ws.cell(1, column).value for column in range(1, 29)],
+            [ws.cell(1, column).value for column in range(1, 31)],
             TRADE_HEADERS,
         )
         self.assertIn("ROUNDDOWN", ws["F2"].value)
         self.assertIn("IF(OR(", ws["F2"].value)
-        self.assertEqual(ws["J2"].value, '=IF(I2="","",F2)')
-        self.assertIn('IF(M2="",0,M2)', ws["V2"].value)
-        self.assertIn('IF(N2="",0,N2)', ws["V2"].value)
-        self.assertNotIn("{row}", ws["V2"].value)
-        self.assertIn('IF(OR(V2="",E2="",F2=""),"",IF(', ws["W2"].value)
-        self.assertIn('OR(A2=""', ws["Z2"].value)
-        self.assertIn("'多次统计数据'!$B$8", ws["Z2"].value)
-        self.assertIn("'多次统计数据'!$B$9", ws["AA2"].value)
+        self.assertIn("'账户数据'!$B$9", ws["G2"].value)
+        self.assertIn("'账户数据'!$B$7", ws["G2"].value)
+        self.assertIn('"禁止开仓"', ws["G2"].value)
+        self.assertEqual(ws["L2"].value, '=IF(K2="","",H2)')
+        self.assertIn('IF(O2="",0,O2)', ws["X2"].value)
+        self.assertIn('IF(P2="",0,P2)', ws["X2"].value)
+        self.assertIn("E2*H2", ws["X2"].value)
+        self.assertNotIn("E2*F2", ws["X2"].value)
+        self.assertNotIn("{row}", ws["X2"].value)
+        self.assertIn('IF(OR(X2="",E2="",H2=""),"",IF(', ws["Y2"].value)
+        self.assertIn('OR(A2=""', ws["AB2"].value)
+        self.assertIn("'多次统计数据'!$B$8", ws["AB2"].value)
+        self.assertIn("'多次统计数据'!$B$9", ws["AC2"].value)
 
     def test_input_and_formula_cells_use_distinct_fills(self):
         ws = self.workbook["单次交易"]
         self.assertEqual(ws["C2"].fill.fgColor.rgb, "00DDEBF7")
         self.assertEqual(ws["D2"].fill.fgColor.rgb, "00DDEBF7")
         self.assertEqual(ws["F2"].fill.fgColor.rgb, "00E7E6E6")
-        self.assertEqual(ws["V2"].fill.fgColor.rgb, "00E7E6E6")
+        self.assertEqual(ws["G2"].fill.fgColor.rgb, "00E7E6E6")
+        self.assertEqual(ws["H2"].fill.fgColor.rgb, "00DDEBF7")
+        self.assertEqual(ws["X2"].fill.fgColor.rgb, "00E7E6E6")
 
     def test_trade_and_reason_logs_are_filterable_and_frozen(self):
         trade = self.workbook["单次交易"]
@@ -267,7 +368,27 @@ class WorkbookStructureTests(unittest.TestCase):
         self.assertEqual(len(trade.tables), 1)
         self.assertEqual(len(reasons.tables), 1)
         self.assertGreater(len(trade.data_validations.dataValidation), 5)
-        self.assertGreater(len(reasons.data_validations.dataValidation), 1)
+        self.assertGreater(len(reasons.data_validations.dataValidation), 2)
+
+    def test_indicator_dropdowns_reference_the_technical_indicator_sheet(self):
+        indicators = self.workbook["技术指标"]
+        reasons = self.workbook["买入理由"]
+        self.assertEqual(indicators["A1"].value, "技术指标")
+        self.assertEqual(indicators["A2"].value, "蜡烛图")
+        indicator_values = [
+            indicators.cell(row, 1).value
+            for row in range(2, indicators.max_row + 1)
+        ]
+        self.assertIn("趋势线", indicator_values)
+        self.assertIn("MACD", indicator_values)
+        self.assertIn("技术指标列表", self.workbook.defined_names)
+        indicator_validations = [
+            item
+            for item in reasons.data_validations.dataValidation
+            if item.formula1 == "=技术指标列表"
+        ]
+        self.assertEqual(len(indicator_validations), 1)
+        self.assertIn("F2:H501", str(indicator_validations[0].sqref))
 
     def test_statistics_account_and_target_formulas_follow_metric_contract(self):
         stats = self.workbook["多次统计数据"]
@@ -277,18 +398,31 @@ class WorkbookStructureTests(unittest.TestCase):
         self.assertIn("-AVERAGEIF", stats["B9"].value)
         self.assertIn("B6*B8-B7*B9", stats["B13"].value)
         self.assertIn("POWER(1+B8,B3)", stats["B14"].value)
-        self.assertIn("SUM('单次交易'!V2:V201)", account["B3"].value)
+        self.assertIn("'单次交易'!E2:E201", stats["B12"].value)
+        self.assertIn("'单次交易'!H2:H201", stats["B12"].value)
+        self.assertNotIn("'单次交易'!F2:F201", stats["B12"].value)
+        self.assertIn("SUM('单次交易'!X2:X201)", account["B3"].value)
         self.assertIn("SUMIFS", account["B8"].value)
         self.assertIn("EOMONTH(TODAY()", account["B8"].value)
+        self.assertEqual(account["A6"].value, "当月允许最大亏损比例")
+        self.assertEqual(account["A7"].value, "当月允许最大亏损金额")
+        self.assertEqual(account["A9"].value, "当前未平仓理论亏损")
+        self.assertEqual(account["A10"].value, "当月剩余可开仓风险额度")
+        self.assertIn("SUMPRODUCT", account["B9"].value)
+        self.assertIn("'单次交易'!H2:H201", account["B9"].value)
+        self.assertEqual(
+            account["B10"].value,
+            '=IF(OR(B7="",B9=""),"",B7-B9)',
+        )
         self.assertIn('"暂不可计算"', target["B7"].value)
         self.assertIn("ROUNDUP", target["B7"].value)
 
     def test_workbook_has_validations_risk_formatting_and_auto_calculation(self):
         trade = self.workbook["单次交易"]
         self.assertGreater(len(trade.conditional_formatting), 3)
-        self.assertEqual(trade["S2"].number_format, "0.00%")
-        self.assertEqual(trade["G2"].number_format, "yyyy-mm-dd")
-        self.assertEqual(trade["V2"].number_format, '¥#,##0.00;[Red]-¥#,##0.00')
+        self.assertEqual(trade["U2"].number_format, "0.00%")
+        self.assertEqual(trade["I2"].number_format, "yyyy-mm-dd")
+        self.assertEqual(trade["X2"].number_format, '¥#,##0.00;[Red]-¥#,##0.00')
         self.assertEqual(self.workbook.calculation.calcMode, "auto")
         self.assertTrue(self.workbook.calculation.fullCalcOnLoad)
         self.assertTrue(self.workbook.calculation.forceFullCalc)
@@ -332,7 +466,7 @@ class IntegrationTests(unittest.TestCase):
         )
         return recalculated
 
-    def test_sample_workbook_recalculates_to_expected_metrics(self):
+    def test_100_trade_sample_workbook_recalculates_to_expected_metrics(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = root / "source" / "交易管理系统_测试版.xlsx"
@@ -353,33 +487,48 @@ class IntegrationTests(unittest.TestCase):
             account = values["账户数据"]
             target = values["目标收益"]
 
-            expected_positions = [1_000, 1_000, 600, 1_200, 600, 500]
-            expected_pnl = [990, -1_210, 1_790, -732, 0, None]
-            for row, expected in enumerate(expected_positions, start=2):
-                self.assertEqual(trade.cell(row, 6).value, expected)
-            for row, expected in enumerate(expected_pnl, start=2):
-                if expected is None:
-                    self.assertIsNone(trade.cell(row, 22).value)
+            expected_items = tw.generate_sample_transactions(
+                self.AS_OF_DATE,
+                count=100,
+            )
+            expected_trades = tw.sample_trade_metrics(self.AS_OF_DATE)
+            for row, item, metric in zip(
+                range(2, 102),
+                expected_items,
+                expected_trades,
+            ):
+                self.assertEqual(
+                    trade.cell(row, 6).value,
+                    item["suggested_shares"],
+                )
+                self.assertEqual(
+                    trade.cell(row, 8).value,
+                    item["actual_buy_shares"],
+                )
+                if metric["pnl"] is None:
+                    self.assertIsNone(trade.cell(row, 24).value)
                 else:
-                    self.assertAlmostEqual(trade.cell(row, 22).value, expected)
-            for column in (6, 10, 19, 20, 21, 22, 23, 24, 25, 26, 27):
+                    self.assertAlmostEqual(
+                        trade.cell(row, 24).value,
+                        metric["pnl"],
+                    )
+            for column in (6, 7, 12, 21, 22, 23, 24, 25, 26, 27, 28, 29):
                 self.assertIsNone(
-                    trade.cell(8, column).value,
+                    trade.cell(102, column).value,
                     msg=f"blank row formula column {column} must stay blank",
                 )
 
-            expected_trades = tw.sample_trade_metrics(self.AS_OF_DATE)
             summary = summarize_trades(expected_trades)
-            self.assertEqual(stats["B2"].value, 5)
-            self.assertEqual(stats["B3"].value, 2)
-            self.assertEqual(stats["B4"].value, 2)
-            self.assertEqual(stats["B5"].value, 1)
+            self.assertEqual(stats["B2"].value, summary["completed_count"])
+            self.assertEqual(stats["B3"].value, summary["win_count"])
+            self.assertEqual(stats["B4"].value, summary["loss_count"])
+            self.assertEqual(stats["B5"].value, summary["flat_count"])
             self.assertAlmostEqual(stats["B6"].value, summary["win_rate"])
             self.assertAlmostEqual(stats["B7"].value, summary["loss_rate"])
             self.assertAlmostEqual(stats["B8"].value, summary["average_win"])
             self.assertAlmostEqual(stats["B9"].value, summary["average_loss"])
-            self.assertEqual(stats["B10"].value, 13)
-            self.assertEqual(stats["B11"].value, 5)
+            self.assertEqual(stats["B10"].value, summary["win_hold_days"])
+            self.assertEqual(stats["B11"].value, summary["loss_hold_days"])
             self.assertAlmostEqual(
                 stats["B12"].value,
                 summary["average_trade_amount"],
@@ -396,7 +545,37 @@ class IntegrationTests(unittest.TestCase):
                 if trade["pnl"] is not None
             )
             self.assertAlmostEqual(account["B3"].value, current_balance)
-            self.assertEqual(account["B8"].value, -732)
+            expected_monthly_loss = calculate_monthly_loss(
+                expected_trades,
+                self.AS_OF_DATE,
+            )
+            self.assertAlmostEqual(
+                account["B8"].value,
+                expected_monthly_loss,
+            )
+            self.assertLess(account["B8"].value, 0)
+            expected_open_risk = tw.calculate_open_theoretical_loss(
+                expected_trades,
+            )
+            self.assertAlmostEqual(account["B9"].value, expected_open_risk)
+            monthly_limit = current_balance * 0.05
+            self.assertAlmostEqual(account["B7"].value, monthly_limit)
+            self.assertAlmostEqual(
+                account["B10"].value,
+                monthly_limit - expected_open_risk,
+            )
+            candidate = expected_items[-1]
+            candidate_risk = (
+                candidate["suggested_shares"]
+                * (candidate["buy_price"] - candidate["stop_price"])
+            )
+            expected_status = tw.calculate_opening_risk_status(
+                expected_open_risk,
+                candidate_risk,
+                monthly_limit,
+            )
+            self.assertEqual(trade["G101"].value, expected_status)
+            self.assertEqual(expected_status, "禁止开仓")
             self.assertAlmostEqual(target["B2"].value, current_balance)
             self.assertAlmostEqual(target["B4"].value, current_balance * 0.10)
             expected_count = calculate_required_trades(
@@ -422,6 +601,29 @@ class IntegrationTests(unittest.TestCase):
             self.assertIsNone(clean_wb["单次交易"]["A2"].value)
             self.assertEqual(sample_wb["单次交易"]["A2"].value, "T2026001")
             self.assertEqual(sample_wb["买入理由"]["D2"].value, "买入")
+
+    def test_progressive_validator_recalculates_after_each_append(self):
+        validator = importlib.import_module("progressive_workbook_validation")
+        with tempfile.TemporaryDirectory() as temporary:
+            result = validator.run_progressive_validation(
+                output_dir=temporary,
+                as_of_date=self.AS_OF_DATE,
+                steps=3,
+                quiet=True,
+            )
+            self.assertEqual(len(result["audit_rows"]), 3)
+            self.assertEqual(
+                [row["step"] for row in result["audit_rows"]],
+                [1, 2, 3],
+            )
+            self.assertTrue(
+                all(row["result"] == "PASS" for row in result["audit_rows"])
+            )
+            self.assertTrue(result["workbook_path"].exists())
+            self.assertTrue(result["report_path"].exists())
+            final = load_workbook(result["workbook_path"], data_only=True)
+            self.assertEqual(final["单次交易"]["A4"].value, "T2026003")
+            self.assertIsNone(final["单次交易"]["A5"].value)
 
     def test_main_writes_deliverables_to_requested_directory(self):
         with tempfile.TemporaryDirectory() as temporary:
