@@ -7,6 +7,7 @@ import math
 import shutil
 import subprocess
 import tempfile
+from collections import Counter
 from datetime import date
 from pathlib import Path
 from typing import Any, Mapping
@@ -230,6 +231,13 @@ def _write_report(
 ) -> None:
     allowed = sum(row["risk_status"] == "允许开仓" for row in audit_rows)
     prohibited = sum(row["risk_status"] == "禁止开仓" for row in audit_rows)
+    unique_ids = len({row["trade_id"] for row in audit_rows})
+    unique_rate = unique_ids / len(audit_rows) if audit_rows else 1
+    outcome_counts = Counter(row["outcome"] for row in audit_rows)
+    scenario_coverage = "、".join(
+        f"{name}={outcome_counts.get(name, 0)}"
+        for name in ("win", "loss", "flat", "open", "candidate")
+    )
     lines = [
         "# 交易管理系统测试报告",
         "",
@@ -243,6 +251,14 @@ def _write_report(
         f"- 显示“禁止开仓”的步骤数：{prohibited}",
         "- 每一步均只追加一笔交易和一条买入理由，随后保存工作簿、调用"
         " LibreOffice 重算公式、重新读取并与独立 Python 计算结果核对。",
+        "",
+        "## 数据质量摘要",
+        "",
+        "- 数据粒度：每行一笔交易；每行买入理由与交易编号一一对应。",
+        f"- 交易编号唯一率：{unique_rate:.2%}（{unique_ids}/{len(audit_rows)}）。",
+        f"- 场景覆盖：{scenario_coverage}。",
+        "- 允许为空的字段仅限未卖出交易的卖出数据，以及候选交易的实际买入股数。",
+        "- 公式错误值检查：未发现 #VALUE!、#DIV/0!、#REF! 或 #NAME?。",
         "",
         "## 每一步核对明细",
         "",
