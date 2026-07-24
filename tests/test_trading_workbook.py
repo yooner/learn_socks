@@ -1,7 +1,12 @@
 import math
+import shutil
+import subprocess
+import tempfile
 import unittest
 from datetime import date
+from pathlib import Path
 
+from openpyxl import load_workbook
 import trading_workbook as tw
 from trading_workbook import (
     calculate_compound_loss_ceiling,
@@ -239,6 +244,9 @@ class WorkbookStructureTests(unittest.TestCase):
         self.assertIn("ROUNDDOWN", ws["F2"].value)
         self.assertIn("IF(OR(", ws["F2"].value)
         self.assertEqual(ws["J2"].value, '=IF(I2="","",F2)')
+        self.assertIn('IF(M2="",0,M2)', ws["V2"].value)
+        self.assertIn('IF(N2="",0,N2)', ws["V2"].value)
+        self.assertNotIn("{row}", ws["V2"].value)
         self.assertIn("'多次统计数据'!$B$8", ws["Z2"].value)
         self.assertIn("'多次统计数据'!$B$9", ws["AA2"].value)
 
@@ -282,6 +290,131 @@ class WorkbookStructureTests(unittest.TestCase):
         self.assertEqual(self.workbook.calculation.calcMode, "auto")
         self.assertTrue(self.workbook.calculation.fullCalcOnLoad)
         self.assertTrue(self.workbook.calculation.forceFullCalc)
+
+
+class IntegrationTests(unittest.TestCase):
+    AS_OF_DATE = date(2026, 7, 24)
+
+    def _recalculate_with_libreoffice(self, source: Path, output_dir: Path) -> Path:
+        soffice = shutil.which("soffice")
+        self.assertIsNotNone(soffice, "LibreOffice is required for formula QA")
+        output_dir.mkdir(parents=True)
+        profile_dir = output_dir / "lo-profile"
+        profile_dir.mkdir()
+        command = [
+            soffice,
+            "--headless",
+            f"-env:UserInstallation={profile_dir.resolve().as_uri()}",
+            "--convert-to",
+            "xlsx",
+            "--outdir",
+            str(output_dir),
+            str(source),
+        ]
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=f"LibreOffice failed: {completed.stdout}\n{completed.stderr}",
+        )
+        recalculated = output_dir / source.name
+        self.assertTrue(
+            recalculated.exists(),
+            msg=f"LibreOffice did not create {recalculated}: {completed.stdout}",
+        )
+        return recalculated
+
+    def test_sample_workbook_recalculates_to_expected_metrics(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source" / "交易管理系统_测试版.xlsx"
+            source.parent.mkdir()
+            workbook = tw.build_workbook(
+                with_sample_data=True,
+                as_of_date=self.AS_OF_DATE,
+            )
+            workbook.save(source)
+            recalculated = self._recalculate_with_libreoffice(
+                source,
+                root / "recalculated",
+            )
+            values = load_workbook(recalculated, data_only=True)
+
+            trade = values["单次交易"]
+            stats = values["多次统计数据"]
+            account = values["账户数据"]
+            target = values["目标收益"]
+
+            expected_positions = [1_000, 1_000, 600, 1_200, 600, 500]
+            expected_pnl = [990, -1_210, 1_790, -732, 0, None]
+            for row, expected in enumerate(expected_positions, start=2):
+                self.assertEqual(trade.cell(row, 6).value, expected)
+            for row, expected in enumerate(expected_pnl, start=2):
+                if expected is None:
+                    self.assertIsNone(trade.cell(row, 22).value)
+                else:
+                    self.assertAlmostEqual(trade.cell(row, 22).value, expected)
+
+            expected_trades = tw.sample_trade_metrics(self.AS_OF_DATE)
+            summary = summarize_trades(expected_trades)
+            self.assertEqual(stats["B2"].value, 5)
+            self.assertEqual(stats["B3"].value, 2)
+            self.assertEqual(stats["B4"].value, 2)
+            self.assertEqual(stats["B5"].value, 1)
+            self.assertAlmostEqual(stats["B6"].value, summary["win_rate"])
+            self.assertAlmostEqual(stats["B7"].value, summary["loss_rate"])
+            self.assertAlmostEqual(stats["B8"].value, summary["average_win"])
+            self.assertAlmostEqual(stats["B9"].value, summary["average_loss"])
+            self.assertEqual(stats["B10"].value, 13)
+            self.assertEqual(stats["B11"].value, 5)
+            self.assertAlmostEqual(
+                stats["B12"].value,
+                summary["average_trade_amount"],
+            )
+            self.assertAlmostEqual(stats["B13"].value, summary["expectancy"])
+            self.assertAlmostEqual(
+                stats["B14"].value,
+                summary["compound_return"],
+            )
+
+            current_balance = 100_000 + sum(
+                trade["pnl"]
+                for trade in expected_trades
+                if trade["pnl"] is not None
+            )
+            self.assertAlmostEqual(account["B3"].value, current_balance)
+            self.assertEqual(account["B8"].value, -732)
+            self.assertAlmostEqual(target["B2"].value, current_balance)
+            self.assertAlmostEqual(target["B4"].value, current_balance * 0.10)
+            expected_count = calculate_required_trades(
+                current_balance * 0.10,
+                summary["average_trade_amount"],
+                summary["expectancy"],
+            )
+            self.assertEqual(target["B7"].value, expected_count)
+
+    def test_delivery_writer_creates_clean_and_test_workbooks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            clean, sample = tw.write_workbooks(
+                root,
+                as_of_date=self.AS_OF_DATE,
+            )
+            self.assertEqual(clean.name, "交易管理系统.xlsx")
+            self.assertEqual(sample.name, "交易管理系统_测试版.xlsx")
+            self.assertTrue(clean.exists())
+            self.assertTrue(sample.exists())
+            clean_wb = load_workbook(clean, data_only=False)
+            sample_wb = load_workbook(sample, data_only=False)
+            self.assertIsNone(clean_wb["单次交易"]["A2"].value)
+            self.assertEqual(sample_wb["单次交易"]["A2"].value, "T2026001")
+            self.assertEqual(sample_wb["买入理由"]["D2"].value, "买入")
 
 
 if __name__ == "__main__":

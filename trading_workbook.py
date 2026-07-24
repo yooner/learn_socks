@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from datetime import date
+from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from openpyxl import Workbook
@@ -378,7 +379,7 @@ def _add_trade_formulas(ws, end_row: int) -> None:
             22,
             (
                 f'=IF(OR(I{row}="",J{row}="",E{row}="",F{row}=""),"",'
-                f"I{row}*J{row}-E{row}*F{row}-IF(M{row}="",0,M{row})"
+                f'I{row}*J{row}-E{row}*F{row}-IF(M{row}="",0,M{row})'
                 f'-IF(N{row}="",0,N{row}))'
             ),
         )
@@ -733,12 +734,205 @@ def _build_target_sheet(wb: Workbook):
     return ws
 
 
+def _sample_transaction_inputs(as_of_date: date) -> list[dict[str, Any]]:
+    return [
+        {
+            "trade_id": "T2026001",
+            "stock_code": "600519",
+            "account_snapshot": 100_000,
+            "risk_rate": 0.01,
+            "buy_price": 10,
+            "buy_date": date(2026, 5, 5),
+            "expected_sell_price": 12,
+            "sell_price": 11,
+            "sell_date": date(2026, 5, 10),
+            "stop_price": 9,
+            "buy_fee": 5,
+            "sell_fee": 5,
+            "sources": ("箱体突破回踩", "前低下方", "前高附近", "按计划止盈"),
+            "score": "4-良好",
+        },
+        {
+            "trade_id": "T2026002",
+            "stock_code": "000001",
+            "account_snapshot": 100_990,
+            "risk_rate": 0.01,
+            "buy_price": 20,
+            "buy_date": date(2026, 6, 1),
+            "expected_sell_price": 23,
+            "sell_price": 18.8,
+            "sell_date": date(2026, 6, 4),
+            "stop_price": 19,
+            "buy_fee": 5,
+            "sell_fee": 5,
+            "sources": ("均线企稳", "关键均线下方", "前高", "跌破止损"),
+            "score": "2-较差",
+        },
+        {
+            "trade_id": "T2026003",
+            "stock_code": "300750",
+            "account_snapshot": 99_780,
+            "risk_rate": 0.01,
+            "buy_price": 25,
+            "buy_date": date(2026, 6, 10),
+            "expected_sell_price": 29,
+            "sell_price": 28,
+            "sell_date": date(2026, 6, 18),
+            "stop_price": 23.5,
+            "buy_fee": 5,
+            "sell_fee": 5,
+            "sources": ("放量突破", "突破位下方", "压力区", "分批计划的加权价"),
+            "score": "5-优秀",
+        },
+        {
+            "trade_id": "T2026004",
+            "stock_code": "002594",
+            "account_snapshot": 101_570,
+            "risk_rate": 0.01,
+            "buy_price": 15,
+            "buy_date": date(as_of_date.year, as_of_date.month, 1),
+            "expected_sell_price": 17,
+            "sell_price": 14.4,
+            "sell_date": date(as_of_date.year, as_of_date.month, 3),
+            "stop_price": 14.2,
+            "buy_fee": 6,
+            "sell_fee": 6,
+            "sources": ("支撑位反弹", "支撑下方", "前高", "弱势退出"),
+            "score": "2-较差",
+        },
+        {
+            "trade_id": "T2026005",
+            "stock_code": "601318",
+            "account_snapshot": 100_838,
+            "risk_rate": 0.01,
+            "buy_price": 30,
+            "buy_date": date(as_of_date.year, as_of_date.month, 5),
+            "expected_sell_price": 33,
+            "sell_price": 30,
+            "sell_date": date(as_of_date.year, as_of_date.month, 6),
+            "stop_price": 28.5,
+            "buy_fee": 0,
+            "sell_fee": 0,
+            "sources": ("横盘试仓", "箱体下沿", "箱体上沿", "信号失效持平退出"),
+            "score": "3-一般",
+        },
+        {
+            "trade_id": "T2026006",
+            "stock_code": "688981",
+            "account_snapshot": 100_838,
+            "risk_rate": 0.01,
+            "buy_price": 40,
+            "buy_date": date(as_of_date.year, as_of_date.month, 10),
+            "expected_sell_price": 45,
+            "sell_price": None,
+            "sell_date": None,
+            "stop_price": 38,
+            "buy_fee": 5,
+            "sell_fee": 0,
+            "sources": ("行业趋势转强", "突破位下方", "前高区域", ""),
+            "score": "",
+        },
+    ]
+
+
+def sample_trade_metrics(as_of_date: date) -> list[dict[str, Any]]:
+    """Return the calculation-grain records represented by sample workbook rows."""
+    result = []
+    for item in _sample_transaction_inputs(as_of_date):
+        shares = calculate_position_size(
+            item["account_snapshot"],
+            item["risk_rate"],
+            item["buy_price"],
+            item["stop_price"],
+        )
+        pnl = None
+        return_rate = None
+        hold_days = None
+        if item["sell_price"] is not None and item["sell_date"] is not None:
+            pnl = calculate_realized_pnl(
+                item["buy_price"],
+                shares,
+                item["sell_price"],
+                shares,
+                item["buy_fee"],
+                item["sell_fee"],
+            )
+            return_rate = calculate_return_rate(
+                pnl,
+                item["buy_price"],
+                shares,
+                item["buy_fee"],
+            )
+            hold_days = (item["sell_date"] - item["buy_date"]).days
+        result.append(
+            {
+                "pnl": pnl,
+                "return_rate": return_rate,
+                "hold_days": hold_days,
+                "trade_amount": item["buy_price"] * shares,
+                "sell_date": item["sell_date"],
+            }
+        )
+    return result
+
+
+def _populate_sample_data(wb: Workbook, as_of_date: date) -> None:
+    trade_ws = wb["单次交易"]
+    for row, item in enumerate(
+        _sample_transaction_inputs(as_of_date),
+        start=2,
+    ):
+        values = {
+            1: item["trade_id"],
+            2: item["stock_code"],
+            3: item["account_snapshot"],
+            4: item["risk_rate"],
+            5: item["buy_price"],
+            7: item["buy_date"],
+            8: item["expected_sell_price"],
+            9: item["sell_price"],
+            11: item["sell_date"],
+            12: item["stop_price"],
+            13: item["buy_fee"],
+            14: item["sell_fee"],
+            15: item["sources"][0],
+            16: item["sources"][1],
+            17: item["sources"][2],
+            18: item["sources"][3],
+            28: item["score"],
+        }
+        for column, value in values.items():
+            trade_ws.cell(row, column).value = value
+
+    reason_rows = [
+        ("T2026001", "600519", "白酒", "买入", date(2026, 5, 5), "箱体突破", "成交量放大", "板块同步", "回踩后站稳关键位"),
+        ("T2026001", "600519", "白酒", "持续追踪", date(2026, 5, 7), "缩量整理", "支撑未破", "板块稳定", "继续按原计划观察"),
+        ("T2026001", "600519", "白酒", "卖出", date(2026, 5, 10), "接近目标位", "动能减弱", "获利盘增加", "按计划止盈"),
+        ("T2026002", "000001", "银行", "买入", date(2026, 6, 1), "均线企稳", "低位放量", "板块轮动", "尝试右侧确认"),
+        ("T2026002", "000001", "银行", "卖出", date(2026, 6, 4), "跌破均线", "量能放大", "板块转弱", "触发止损退出"),
+        ("T2026003", "300750", "新能源", "买入", date(2026, 6, 10), "放量突破", "趋势向上", "板块共振", "突破有效后买入"),
+        ("T2026003", "300750", "新能源", "持续追踪", date(2026, 6, 14), "回踩不破", "量能健康", "相对强势", "持仓条件仍成立"),
+        ("T2026003", "300750", "新能源", "卖出", date(2026, 6, 18), "接近压力", "涨速放缓", "分歧增加", "按加权成交价记录"),
+        ("T2026004", "002594", "汽车", "买入", date(as_of_date.year, as_of_date.month, 1), "支撑反弹", "下影线", "板块一般", "小仓位验证"),
+        ("T2026004", "002594", "汽车", "卖出", date(as_of_date.year, as_of_date.month, 3), "支撑失效", "收盘跌破", "板块走弱", "执行止损"),
+        ("T2026005", "601318", "保险", "买入", date(as_of_date.year, as_of_date.month, 5), "横盘", "波动收窄", "板块中性", "等待方向选择"),
+        ("T2026005", "601318", "保险", "卖出", date(as_of_date.year, as_of_date.month, 6), "信号消失", "量能不足", "无明显共振", "持平退出"),
+        ("T2026006", "688981", "半导体", "买入", date(as_of_date.year, as_of_date.month, 10), "行业转强", "突破平台", "成交放大", "未卖出，持续追踪"),
+    ]
+    reason_ws = wb["买入理由"]
+    for row, values in enumerate(reason_rows, start=2):
+        for column, value in enumerate(values, start=1):
+            reason_ws.cell(row, column).value = value
+
+    wb["账户数据"]["B2"] = 100_000
+    wb["目标收益"]["B3"] = 0.10
+
+
 def build_workbook(
     with_sample_data: bool = False,
     as_of_date: date | None = None,
 ) -> Workbook:
     """Build the five-sheet trading workbook."""
-    del with_sample_data, as_of_date
     wb = Workbook()
     wb.remove(wb.active)
     _build_trade_sheet(wb)
@@ -749,4 +943,24 @@ def build_workbook(
     wb.calculation.calcMode = "auto"
     wb.calculation.fullCalcOnLoad = True
     wb.calculation.forceFullCalc = True
+    if with_sample_data:
+        _populate_sample_data(wb, as_of_date or date.today())
     return wb
+
+
+def write_workbooks(
+    output_dir: str | Path,
+    as_of_date: date | None = None,
+) -> tuple[Path, Path]:
+    """Write the clean template and synthetic test workbook."""
+    destination = Path(output_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    effective_date = as_of_date or date.today()
+    clean_path = destination / "交易管理系统.xlsx"
+    sample_path = destination / "交易管理系统_测试版.xlsx"
+    build_workbook(with_sample_data=False).save(clean_path)
+    build_workbook(
+        with_sample_data=True,
+        as_of_date=effective_date,
+    ).save(sample_path)
+    return clean_path, sample_path
