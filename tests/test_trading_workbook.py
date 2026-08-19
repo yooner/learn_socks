@@ -23,6 +23,7 @@ from trading_workbook import (
 
 EXPECTED_SHEETS = [
     "单次交易",
+    "持仓跟踪",
     "买入理由",
     "多次统计数据",
     "账户数据",
@@ -66,6 +67,290 @@ TRADE_HEADERS = [
 
 
 class CalculationTests(unittest.TestCase):
+    def test_tranche_position_calculates_weighted_cost_shares_and_risk(self):
+        result = tw.calculate_tranche_position(
+            [(10.0, 1_000), (8.0, 500), (12.0, 500)],
+            effective_stop=9.0,
+        )
+
+        self.assertEqual(result["total_shares"], 2_000)
+        self.assertAlmostEqual(result["buy_amount"], 20_000.0)
+        self.assertAlmostEqual(result["weighted_buy_price"], 10.0)
+        self.assertAlmostEqual(result["current_risk"], 2_500.0)
+
+    def test_tranche_position_never_counts_negative_risk(self):
+        result = tw.calculate_tranche_position(
+            [(10.0, 100), (8.0, 100), (None, None)],
+            effective_stop=9.0,
+        )
+
+        self.assertEqual(result["current_risk"], 100.0)
+
+    def test_closed_tranche_position_has_zero_current_risk(self):
+        result = tw.calculate_tranche_position(
+            [(10.0, 100), (8.0, 100), (None, None)],
+            effective_stop=7.0,
+            is_closed=True,
+        )
+
+        self.assertEqual(result["current_risk"], 0.0)
+
+    def test_tranche_rules_enforce_pair_order_lots_lock_and_risk(self):
+        cases = [
+            (
+                None,
+                [(None, None)] * 3,
+                False,
+                0,
+                1_000,
+                0,
+                5_000,
+                "",
+            ),
+            (
+                "T1",
+                [(10, None), (None, None), (None, None)],
+                False,
+                0,
+                1_000,
+                0,
+                5_000,
+                "违规：第一批价格或股数缺失",
+            ),
+            (
+                "T1",
+                [(10, 100), (9, None), (None, None)],
+                False,
+                0,
+                1_000,
+                0,
+                5_000,
+                "违规：第二批价格与股数须成对填写",
+            ),
+            (
+                "T1",
+                [(10, 100), (9, 100), (8, None)],
+                False,
+                0,
+                1_000,
+                0,
+                5_000,
+                "违规：第三批价格与股数须成对填写",
+            ),
+            (
+                "T1",
+                [(10, 100), (None, None), (8, 100)],
+                False,
+                0,
+                1_000,
+                0,
+                5_000,
+                "违规：必须先完成第二批",
+            ),
+            (
+                "T1",
+                [(10, 150), (None, None), (None, None)],
+                False,
+                0,
+                1_000,
+                0,
+                5_000,
+                "违规：股数须为100股整数倍",
+            ),
+            (
+                "T1",
+                [(10, 100), (9, 100), (None, None)],
+                True,
+                900,
+                1_000,
+                900,
+                5_000,
+                "违规：锁仓期间禁止加仓",
+            ),
+            (
+                "T1",
+                [(10, 100), (9, 100), (None, None)],
+                False,
+                1_001,
+                1_000,
+                1_001,
+                5_000,
+                "违规：超过单笔风险上限",
+            ),
+            (
+                "T1",
+                [(10, 100), (9, 100), (None, None)],
+                False,
+                900,
+                1_000,
+                1_200,
+                1_199,
+                "违规：超过账户风险上限",
+            ),
+            (
+                "T1",
+                [(10, 100), (9, 100), (None, None)],
+                False,
+                1_000,
+                1_000,
+                5_000,
+                5_000,
+                "通过",
+            ),
+        ]
+
+        for (
+            trade_id,
+            tranches,
+            locked,
+            position_risk,
+            one_limit,
+            total_risk,
+            account_limit,
+            expected,
+        ) in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(
+                    tw.check_tranche_rules(
+                        trade_id,
+                        tranches,
+                        locked,
+                        position_risk,
+                        one_limit,
+                        total_risk,
+                        account_limit,
+                    ),
+                    expected,
+                )
+
+    def test_trade_expectation_period_matching_uses_the_agreed_ranges(self):
+        matching_cases = [
+            ("短期博反弹", "1～3个交易日"),
+            ("短期博反弹", "4～10个交易日"),
+            ("突破冲新高", "4～10个交易日"),
+            ("突破冲新高", "11～20个交易日"),
+            ("趋势波段", "11～20个交易日"),
+            ("趋势波段", "21～60个交易日"),
+            ("趋势波段", "60个交易日以上"),
+        ]
+        for trade_type, holding_period in matching_cases:
+            with self.subTest(
+                trade_type=trade_type,
+                holding_period=holding_period,
+            ):
+                self.assertEqual(
+                    tw.check_trade_expectation_period(
+                        trade_type,
+                        holding_period,
+                    ),
+                    "匹配",
+                )
+        self.assertEqual(
+            tw.check_trade_expectation_period(
+                "短期博反弹",
+                "21～60个交易日",
+            ),
+            "周期与交易预期不匹配，请重新确认",
+        )
+        self.assertIsNone(tw.check_trade_expectation_period("", "1～3个交易日"))
+
+    def test_dynamic_stop_uses_historical_high_and_never_moves_down(self):
+        result = tw.calculate_dynamic_stop_history(
+            initial_stop=9,
+            plan_levels=[
+                {"stage": 1, "activation_price": 11, "stop_price": 10},
+                {"stage": 2, "activation_price": 12, "stop_price": 11},
+                {"stage": 3, "activation_price": 14, "stop_price": 12.5},
+            ],
+            closing_prices=[10, 12.2, 10.8],
+        )
+
+        self.assertEqual(
+            [item["effective_stop"] for item in result],
+            [9, 11, 11],
+        )
+        self.assertEqual(
+            [item["activated_stage"] for item in result],
+            [0, 2, 2],
+        )
+        self.assertEqual(result[-1]["stop_status"], "触发止损：应全部卖出")
+
+    def test_manual_dynamic_stop_can_raise_but_cannot_lower_the_stop(self):
+        result = tw.calculate_dynamic_stop_history(
+            initial_stop=9,
+            plan_levels=[
+                {"stage": 1, "activation_price": 11, "stop_price": 10},
+            ],
+            closing_prices=[10, 11.2, 11.1],
+            manual_stops=[None, 10.8, 10.2],
+        )
+
+        self.assertEqual(
+            [item["effective_stop"] for item in result],
+            [9, 10.8, 10.8],
+        )
+        self.assertTrue(result[-1]["manual_stop_rejected"])
+
+    def test_closing_at_the_effective_stop_triggers_a_full_exit(self):
+        result = tw.calculate_dynamic_stop_history(
+            initial_stop=9,
+            plan_levels=[],
+            closing_prices=[9],
+        )
+
+        self.assertEqual(result[0]["stop_status"], "触发止损：应全部卖出")
+
+    def test_consecutive_loss_cycle_locks_at_six_percent_after_latest_win(self):
+        result = tw.calculate_consecutive_loss_lock(
+            [100, -30, -40],
+            initial_balance=1_000,
+            loss_limit_rate=0.06,
+        )
+
+        self.assertEqual(result["latest_win_sequence"], 1)
+        self.assertEqual(result["cycle_start_sequence"], 1)
+        self.assertEqual(result["cycle_start_balance"], 1_100)
+        self.assertEqual(result["cycle_loss"], 70)
+        self.assertEqual(result["status"], "已锁仓")
+
+    def test_consecutive_loss_cycle_resets_after_every_profit(self):
+        result = tw.calculate_consecutive_loss_lock(
+            [100, -100, 10, -40],
+            initial_balance=1_000,
+            loss_limit_rate=0.06,
+        )
+
+        self.assertEqual(result["latest_win_sequence"], 3)
+        self.assertEqual(result["cycle_start_balance"], 1_010)
+        self.assertEqual(result["cycle_loss"], 40)
+        self.assertEqual(result["status"], "正常")
+
+    def test_manual_unlock_starts_a_new_cycle_after_the_selected_record(self):
+        locked = tw.calculate_consecutive_loss_lock(
+            [100, -70],
+            initial_balance=1_000,
+            loss_limit_rate=0.06,
+        )
+        incomplete = tw.calculate_consecutive_loss_lock(
+            [100, -70],
+            initial_balance=1_000,
+            loss_limit_rate=0.06,
+            manual_unlock_through=2,
+        )
+        unlocked = tw.calculate_consecutive_loss_lock(
+            [100, -70],
+            initial_balance=1_000,
+            loss_limit_rate=0.06,
+            manual_unlock_through=2,
+            unlock_reason="模拟复盘完成",
+        )
+
+        self.assertEqual(locked["status"], "已锁仓")
+        self.assertEqual(incomplete["status"], "解锁信息不完整")
+        self.assertEqual(unlocked["cycle_start_sequence"], 2)
+        self.assertEqual(unlocked["cycle_loss"], 0)
+        self.assertEqual(unlocked["status"], "正常")
+
     def test_position_size_rounds_down_to_a_share_lot(self):
         self.assertEqual(
             calculate_position_size(
@@ -359,6 +644,95 @@ class WorkbookStructureTests(unittest.TestCase):
     def test_workbook_has_the_six_agreed_sheets(self):
         self.assertEqual(self.workbook.sheetnames, EXPECTED_SHEETS)
 
+    def test_tracking_sheet_combines_stop_plans_and_daily_records(self):
+        tracking = self.workbook["持仓跟踪"]
+        expected_headers = [
+            "记录类型",
+            "交易编号",
+            "股票代码",
+            "止损阶段序号",
+            "激活价",
+            "激活后止损价",
+            "止损依据",
+            "记录日期",
+            "收盘价",
+            "成交量",
+            "量价分析",
+            "当前阶段",
+            "阶段判断理由",
+            "初始止损",
+            "历史最高收盘价",
+            "已激活止损阶段",
+            "当前计划止损",
+            "人工上调止损",
+            "当前有效止损",
+            "下一阶段激活价",
+            "下一阶段止损价",
+            "距离下一阶段涨幅",
+            "止损判断",
+            "卖出动作",
+            "实际卖出价",
+            "实际卖出股数",
+            "卖出费用",
+            "执行检查",
+            "规则检查",
+        ]
+        self.assertEqual(
+            [tracking.cell(1, column).value for column in range(1, 30)],
+            expected_headers,
+        )
+        self.assertEqual(tracking.freeze_panes, "D2")
+        self.assertIn("MAXIFS", tracking["O2"].value)
+        self.assertIn("MAXIFS", tracking["Q2"].value)
+        self.assertIn("MAXIFS", tracking["S2"].value)
+        self.assertIn('"触发止损：应全部卖出"', tracking["W2"].value)
+        self.assertIn('"执行卖出"', tracking["AB2"].value)
+        self.assertIn("计划有效", tracking["AC2"].value)
+        self.assertEqual(len(tracking.tables), 1)
+
+    def test_opening_guard_requires_a_valid_stop_plan(self):
+        trade = self.workbook["单次交易"]
+        self.assertIn("'持仓跟踪'!$A$2:$A$501", trade["G2"].value)
+        self.assertIn("禁止开仓：请先填写止损计划", trade["G2"].value)
+        share_validations = [
+            item
+            for item in trade.data_validations.dataValidation
+            if "H2:H201" in str(item.sqref)
+        ]
+        self.assertEqual(len(share_validations), 1)
+        self.assertIn("_TrackRule", share_validations[0].formula1)
+
+    def test_trade_expectation_fields_are_required_before_opening(self):
+        trade = self.workbook["单次交易"]
+        self.assertEqual(
+            [trade.cell(1, column).value for column in range(33, 37)],
+            [
+                "交易预期类型",
+                "预期持有周期",
+                "预期选择理由",
+                "周期匹配检查",
+            ],
+        )
+        self.assertIn("短期博反弹", trade["AJ2"].value)
+        self.assertIn("突破冲新高", trade["AJ2"].value)
+        self.assertIn("趋势波段", trade["AJ2"].value)
+        self.assertIn("周期与交易预期不匹配", trade["AJ2"].value)
+        self.assertIn('AG2=""', trade["G2"].value)
+        self.assertIn('AH2=""', trade["G2"].value)
+        self.assertIn('AI2=""', trade["G2"].value)
+        self.assertIn("禁止开仓：交易预期未填写完整", trade["G2"].value)
+        self.assertIn("允许开仓（周期需复核）", trade["G2"].value)
+        share_validations = [
+            item
+            for item in trade.data_validations.dataValidation
+            if "H2:H201" in str(item.sqref)
+        ]
+        self.assertEqual(len(share_validations), 1)
+        self.assertIn('AG2<>""', share_validations[0].formula1)
+        self.assertIn('AH2<>""', share_validations[0].formula1)
+        self.assertIn('AI2<>""', share_validations[0].formula1)
+        self.assertEqual(next(iter(trade.tables.values())).ref, "A1:AJ201")
+
     def test_trade_sheet_contains_required_headers_and_guarded_formulas(self):
         ws = self.workbook["单次交易"]
         self.assertEqual(
@@ -371,8 +745,8 @@ class WorkbookStructureTests(unittest.TestCase):
         self.assertIn("IF(OR(", ws["F2"].value)
         self.assertIn("'账户数据'!$B$9", ws["G2"].value)
         self.assertIn("'账户数据'!$B$7", ws["G2"].value)
-        self.assertIn('"禁止开仓"', ws["G2"].value)
-        self.assertEqual(ws["L2"].value, '=IF(K2="","",H2)')
+        self.assertIn("禁止开仓", ws["G2"].value)
+        self.assertIn("'持仓跟踪'!$Z$2:$Z$501", ws["L2"].value)
         self.assertIn('IF(O2="",0,O2)', ws["X2"].value)
         self.assertIn('IF(P2="",0,P2)', ws["X2"].value)
         self.assertIn("E2*H2", ws["X2"].value)
@@ -471,6 +845,31 @@ class WorkbookStructureTests(unittest.TestCase):
         self.assertIn("LN(1+B3)/LN(1+B6)", target["B7"].value)
         self.assertNotIn("B5*B6", target["B7"].value)
 
+    def test_consecutive_loss_lock_controls_and_opening_guard_are_present(self):
+        account = self.workbook["账户数据"]
+        trade = self.workbook["单次交易"]
+
+        self.assertEqual(account["A13"].value, "连续亏损锁仓比例")
+        self.assertEqual(account["B13"].value, 0.06)
+        self.assertEqual(account["A16"].value, "手动解锁截至记录序号")
+        self.assertEqual(account["A17"].value, "手动解锁原因")
+        self.assertEqual(account["A23"].value, "连续亏损锁仓状态")
+        self.assertIn("LOOKUP", account["B14"].value)
+        self.assertIn("MAX(B14", account["B18"].value)
+        self.assertIn("SUMPRODUCT", account["B20"].value)
+        self.assertIn('"解锁信息不完整"', account["B23"].value)
+        self.assertIn('"已锁仓"', account["B23"].value)
+        self.assertIn("'账户数据'!$B$23", trade["G2"].value)
+        self.assertIn("禁止开仓：连续亏损达到上限", trade["G2"].value)
+        self.assertIn("_LockStatus", self.workbook.defined_names)
+        share_validations = [
+            item
+            for item in trade.data_validations.dataValidation
+            if "H2:H201" in str(item.sqref)
+        ]
+        self.assertEqual(len(share_validations), 1)
+        self.assertIn("_LockStatus", share_validations[0].formula1)
+
     def test_workbook_has_validations_risk_formatting_and_auto_calculation(self):
         trade = self.workbook["单次交易"]
         self.assertGreater(len(trade.conditional_formatting), 3)
@@ -485,6 +884,138 @@ class WorkbookStructureTests(unittest.TestCase):
 
 class IntegrationTests(unittest.TestCase):
     AS_OF_DATE = date(2026, 7, 24)
+
+    def test_lock_upgrade_preserves_the_existing_trade_history(self):
+        source = Path(__file__).resolve().parents[1] / "交易管理系统.xlsx"
+        source_values = load_workbook(source, data_only=False)
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "交易管理系统_V2_连续亏损锁仓.xlsx"
+
+            result = tw.upgrade_workbook_with_consecutive_loss_lock(
+                source,
+                destination,
+            )
+
+            upgraded = load_workbook(result, data_only=False)
+            self.assertEqual(upgraded.sheetnames, source_values.sheetnames)
+            self.assertEqual(upgraded.active.title, "账户数据")
+            self.assertEqual(
+                upgraded["单次交易"]["A2"].value,
+                source_values["单次交易"]["A2"].value,
+            )
+            self.assertEqual(
+                upgraded["单次交易"]["AF38"].value,
+                source_values["单次交易"]["AF38"].value,
+            )
+            self.assertEqual(
+                upgraded["账户数据"]["A23"].value,
+                "连续亏损锁仓状态",
+            )
+            self.assertIsNone(source_values["账户数据"]["A23"].value)
+
+    def test_dynamic_stop_upgrade_preserves_history_and_syncs_future_sales(self):
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "交易管理系统_V2_连续亏损锁仓.xlsx"
+        )
+        source_values = load_workbook(source, data_only=False)
+        source_trade = source_values["单次交易"]
+        last_record_row = max(
+            row
+            for row in range(2, 202)
+            if source_trade.cell(row, 1).value not in (None, "")
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "交易管理系统_V3_动态止损.xlsx"
+
+            result = tw.upgrade_workbook_with_dynamic_stop(source, destination)
+
+            upgraded = load_workbook(result, data_only=False)
+            trade = upgraded["单次交易"]
+            future_row = last_record_row + 1
+            self.assertEqual(upgraded.active.title, "持仓跟踪")
+            self.assertEqual(upgraded.sheetnames[1], "持仓跟踪")
+            self.assertEqual(trade["K2"].value, source_trade["K2"].value)
+            self.assertEqual(trade["M2"].value, source_trade["M2"].value)
+            self.assertEqual(trade["AF38"].value, source_trade["AF38"].value)
+            self.assertIn(
+                "'持仓跟踪'!$Y$2:$Y$501",
+                trade.cell(future_row, 11).value,
+            )
+            self.assertIn(
+                "'持仓跟踪'!$Z$2:$Z$501",
+                trade.cell(future_row, 12).value,
+            )
+            self.assertIn(
+                "'持仓跟踪'!$H$2:$H$501",
+                trade.cell(future_row, 13).value,
+            )
+            self.assertIn(
+                "'持仓跟踪'!$AA$2:$AA$501",
+                trade.cell(future_row, 16).value,
+            )
+            self.assertEqual(
+                upgraded["账户数据"]["A23"].value,
+                "连续亏损锁仓状态",
+            )
+
+    def test_sample_workbook_adds_one_valid_stop_plan_per_trade(self):
+        workbook = tw.build_workbook(
+            with_sample_data=True,
+            as_of_date=self.AS_OF_DATE,
+        )
+        tracking = workbook["持仓跟踪"]
+        expected = tw.generate_sample_transactions(self.AS_OF_DATE)
+
+        self.assertEqual(
+            [tracking.cell(row, 1).value for row in range(2, 102)],
+            ["止损计划"] * 100,
+        )
+        self.assertEqual(
+            [tracking.cell(row, 2).value for row in range(2, 102)],
+            [item["trade_id"] for item in expected],
+        )
+        self.assertTrue(
+            all(
+                tracking.cell(row, 5).value
+                > workbook["单次交易"].cell(row, 5).value
+                for row in range(2, 102)
+            )
+        )
+
+    def test_trade_expectation_upgrade_preserves_v3_history_and_tracking(self):
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "交易管理系统_V3_动态止损.xlsx"
+        )
+        source_values = load_workbook(source, data_only=False)
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "交易管理系统_V4_交易预期.xlsx"
+
+            result = tw.upgrade_workbook_with_trade_expectations(
+                source,
+                destination,
+            )
+
+            upgraded = load_workbook(result, data_only=False)
+            trade = upgraded["单次交易"]
+            self.assertEqual(upgraded.active.title, "单次交易")
+            self.assertEqual(
+                trade["A2"].value,
+                source_values["单次交易"]["A2"].value,
+            )
+            self.assertEqual(
+                trade["AF38"].value,
+                source_values["单次交易"]["AF38"].value,
+            )
+            self.assertEqual(
+                upgraded["持仓跟踪"]["A1"].value,
+                source_values["持仓跟踪"]["A1"].value,
+            )
+            self.assertEqual(trade["AG1"].value, "交易预期类型")
+            self.assertEqual(trade["AJ1"].value, "周期匹配检查")
+            self.assertIsNone(trade["AG2"].value)
+            self.assertEqual(next(iter(trade.tables.values())).ref, "A1:AJ201")
 
     def _recalculate_with_libreoffice(self, source: Path, output_dir: Path) -> Path:
         soffice = shutil.which("soffice")
@@ -655,7 +1186,7 @@ class IntegrationTests(unittest.TestCase):
                 candidate_risk,
                 monthly_limit,
             )
-            self.assertEqual(trade["G101"].value, expected_status)
+            self.assertTrue(trade["G101"].value.startswith(expected_status))
             self.assertEqual(expected_status, "禁止开仓")
             self.assertAlmostEqual(target["B2"].value, current_balance)
             self.assertAlmostEqual(target["B4"].value, current_balance * 0.10)

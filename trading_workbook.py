@@ -7,7 +7,7 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.comments import Comment
 from openpyxl.workbook.defined_name import DefinedName
 from openpyxl.formatting.rule import CellIsRule, FormulaRule
@@ -20,7 +20,7 @@ from openpyxl.styles import (
 )
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
-from openpyxl.worksheet.table import Table, TableStyleInfo
+from openpyxl.worksheet.table import Table, TableColumn, TableStyleInfo
 
 TRADE_HEADERS = [
     "交易编号",
@@ -67,6 +67,146 @@ REASON_HEADERS = [
     "技术指标3",
     "综述",
 ]
+
+TRACKING_HEADERS = [
+    "记录类型",
+    "交易编号",
+    "股票代码",
+    "止损阶段序号",
+    "激活价",
+    "激活后止损价",
+    "止损依据",
+    "记录日期",
+    "收盘价",
+    "成交量",
+    "量价分析",
+    "当前阶段",
+    "阶段判断理由",
+    "初始止损",
+    "历史最高收盘价",
+    "已激活止损阶段",
+    "当前计划止损",
+    "人工上调止损",
+    "当前有效止损",
+    "下一阶段激活价",
+    "下一阶段止损价",
+    "距离下一阶段涨幅",
+    "止损判断",
+    "卖出动作",
+    "实际卖出价",
+    "实际卖出股数",
+    "卖出费用",
+    "执行检查",
+    "规则检查",
+]
+
+TRADE_EXPECTATION_TYPES = ("短期博反弹", "突破冲新高", "趋势波段")
+HOLDING_PERIODS = (
+    "1～3个交易日",
+    "4～10个交易日",
+    "11～20个交易日",
+    "21～60个交易日",
+    "60个交易日以上",
+)
+EXPECTATION_PERIOD_MATCHES = {
+    "短期博反弹": {"1～3个交易日", "4～10个交易日"},
+    "突破冲新高": {"4～10个交易日", "11～20个交易日"},
+    "趋势波段": {"11～20个交易日", "21～60个交易日", "60个交易日以上"},
+}
+
+
+def calculate_tranche_position(
+    tranches: Iterable[tuple[float | None, int | None]],
+    effective_stop: float | None,
+    is_closed: bool = False,
+) -> dict[str, float | int | None]:
+    """Calculate aggregate cost, shares, weighted price, and open risk."""
+    valid = [
+        (float(price), int(shares))
+        for price, shares in tranches
+        if price is not None and shares is not None and shares > 0
+    ]
+    total_shares = sum(shares for _, shares in valid)
+    buy_amount = sum(price * shares for price, shares in valid)
+    weighted_buy_price = (
+        buy_amount / total_shares if total_shares else None
+    )
+    stop = float(effective_stop) if effective_stop is not None else None
+    current_risk = (
+        0.0
+        if is_closed or stop is None
+        else sum(
+            max(price - stop, 0.0) * shares
+            for price, shares in valid
+        )
+    )
+    return {
+        "total_shares": total_shares,
+        "buy_amount": buy_amount,
+        "weighted_buy_price": weighted_buy_price,
+        "current_risk": current_risk,
+    }
+
+
+def check_tranche_rules(
+    trade_id: str | None,
+    tranches: Iterable[tuple[float | None, int | None]],
+    is_locked: bool,
+    position_risk: float | None,
+    single_trade_limit: float | None,
+    total_open_risk: float | None,
+    account_risk_limit: float | None,
+) -> str:
+    """Return the first violated three-batch position rule."""
+    if not trade_id:
+        return ""
+    batches = list(tranches)
+    if len(batches) != 3:
+        raise ValueError("exactly three tranche slots are required")
+
+    first_price, first_shares = batches[0]
+    if first_price is None or first_shares is None:
+        return "违规：第一批价格或股数缺失"
+
+    for index, (price, shares) in enumerate(batches[1:], start=2):
+        if (price is None) != (shares is None):
+            return f"违规：第{'二' if index == 2 else '三'}批价格与股数须成对填写"
+
+    second_complete = all(value is not None for value in batches[1])
+    third_complete = all(value is not None for value in batches[2])
+    if third_complete and not second_complete:
+        return "违规：必须先完成第二批"
+
+    completed_shares = [
+        shares
+        for price, shares in batches
+        if price is not None and shares is not None
+    ]
+    if any(
+        not isinstance(shares, (int, float))
+        or shares <= 0
+        or shares != int(shares)
+        or int(shares) % 100 != 0
+        for shares in completed_shares
+    ):
+        return "违规：股数须为100股整数倍"
+
+    has_addition = second_complete or third_complete
+    if has_addition and is_locked:
+        return "违规：锁仓期间禁止加仓"
+    if (
+        position_risk is not None
+        and single_trade_limit is not None
+        and position_risk > single_trade_limit
+    ):
+        return "违规：超过单笔风险上限"
+    if (
+        total_open_risk is not None
+        and account_risk_limit is not None
+        and total_open_risk > account_risk_limit
+    ):
+        return "违规：超过账户风险上限"
+    return "通过"
 
 TECHNICAL_INDICATORS = [
     ("蜡烛图", "价格形态", "观察实体、上下影线及组合形态"),
@@ -319,6 +459,182 @@ def calculate_monthly_loss(
         ):
             total += pnl
     return total
+
+
+def calculate_consecutive_loss_lock(
+    pnls: Iterable[float | None],
+    initial_balance: float,
+    loss_limit_rate: float = 0.06,
+    manual_unlock_through: int | None = None,
+    unlock_reason: str | None = None,
+) -> dict[str, float | int | str]:
+    """Evaluate the loss cycle after the latest profitable record.
+
+    Record sequences are one-based. A valid manual unlock closes the current
+    cycle through the selected record; the next record starts a fresh cycle.
+    """
+    items = list(pnls)
+    latest_closed_sequence = max(
+        (index for index, pnl in enumerate(items, start=1) if pnl is not None),
+        default=0,
+    )
+    latest_win_sequence = max(
+        (
+            index
+            for index, pnl in enumerate(items, start=1)
+            if pnl is not None and pnl > 0
+        ),
+        default=0,
+    )
+    has_unlock_sequence = manual_unlock_through is not None
+    has_unlock_reason = bool(unlock_reason and unlock_reason.strip())
+    unlock_is_valid = (
+        has_unlock_sequence
+        and has_unlock_reason
+        and isinstance(manual_unlock_through, int)
+        and 1 <= manual_unlock_through <= latest_closed_sequence
+    )
+    unlock_is_incomplete = (
+        has_unlock_sequence != has_unlock_reason
+        or (has_unlock_sequence and has_unlock_reason and not unlock_is_valid)
+    )
+    cycle_start_sequence = max(
+        latest_win_sequence,
+        manual_unlock_through if unlock_is_valid else 0,
+    )
+    cycle_start_balance = initial_balance + sum(
+        pnl or 0 for pnl in items[:cycle_start_sequence]
+    )
+    cycle_loss = -sum(
+        pnl
+        for pnl in items[cycle_start_sequence:]
+        if pnl is not None and pnl < 0
+    )
+    loss_ratio = (
+        cycle_loss / cycle_start_balance
+        if cycle_start_balance > 0
+        else 0.0
+    )
+    risk_usage = (
+        loss_ratio / loss_limit_rate if loss_limit_rate > 0 else 0.0
+    )
+    if unlock_is_incomplete:
+        status = "解锁信息不完整"
+    elif risk_usage >= 1:
+        status = "已锁仓"
+    elif risk_usage >= 0.8:
+        status = "接近锁仓"
+    else:
+        status = "正常"
+    return {
+        "latest_win_sequence": latest_win_sequence,
+        "latest_closed_sequence": latest_closed_sequence,
+        "cycle_start_sequence": cycle_start_sequence,
+        "cycle_start_balance": cycle_start_balance,
+        "cycle_loss": cycle_loss,
+        "loss_ratio": loss_ratio,
+        "risk_usage": risk_usage,
+        "status": status,
+    }
+
+
+def calculate_dynamic_stop_history(
+    initial_stop: float,
+    plan_levels: Iterable[Mapping[str, float | int]],
+    closing_prices: Iterable[float],
+    manual_stops: Iterable[float | None] | None = None,
+) -> list[dict[str, float | int | str | bool | None]]:
+    """Calculate long-position stop states from daily closing prices."""
+    levels = sorted(
+        (
+            {
+                "stage": int(level["stage"]),
+                "activation_price": float(level["activation_price"]),
+                "stop_price": float(level["stop_price"]),
+            }
+            for level in plan_levels
+        ),
+        key=lambda level: (level["activation_price"], level["stage"]),
+    )
+    closes = [float(price) for price in closing_prices]
+    manual_values = (
+        list(manual_stops)
+        if manual_stops is not None
+        else [None] * len(closes)
+    )
+    if len(manual_values) != len(closes):
+        raise ValueError("manual_stops must match closing_prices length")
+
+    historical_high = float("-inf")
+    effective_stop = float(initial_stop)
+    result: list[dict[str, float | int | str | bool | None]] = []
+    for close, manual_stop in zip(closes, manual_values):
+        historical_high = max(historical_high, close)
+        activated = [
+            level
+            for level in levels
+            if historical_high >= level["activation_price"]
+        ]
+        activated_stage = max(
+            (level["stage"] for level in activated),
+            default=0,
+        )
+        plan_stop = max(
+            [float(initial_stop)]
+            + [level["stop_price"] for level in activated]
+        )
+        effective_stop = max(effective_stop, plan_stop)
+        manual_stop_rejected = False
+        if manual_stop is not None:
+            manual_value = float(manual_stop)
+            if manual_value < effective_stop:
+                manual_stop_rejected = True
+            else:
+                effective_stop = manual_value
+        pending = [
+            level
+            for level in levels
+            if level["activation_price"] > historical_high
+        ]
+        next_level = min(
+            pending,
+            key=lambda level: (level["activation_price"], level["stage"]),
+            default=None,
+        )
+        result.append(
+            {
+                "closing_price": close,
+                "historical_high": historical_high,
+                "activated_stage": activated_stage,
+                "plan_stop": plan_stop,
+                "effective_stop": effective_stop,
+                "next_activation_price": (
+                    next_level["activation_price"] if next_level else None
+                ),
+                "next_stop_price": (
+                    next_level["stop_price"] if next_level else None
+                ),
+                "manual_stop_rejected": manual_stop_rejected,
+                "stop_status": (
+                    "触发止损：应全部卖出"
+                    if close <= effective_stop
+                    else "继续观察"
+                ),
+            }
+        )
+    return result
+
+
+def check_trade_expectation_period(
+    trade_type: str | None,
+    holding_period: str | None,
+) -> str | None:
+    """Return whether a selected holding range matches the trade thesis."""
+    if not trade_type or not holding_period:
+        return None
+    if holding_period in EXPECTATION_PERIOD_MATCHES.get(trade_type, set()):
+        return "匹配"
+    return "周期与交易预期不匹配，请重新确认"
 
 
 def calculate_required_trades(
@@ -729,6 +1045,208 @@ def _build_reason_sheet(wb: Workbook, end_row: int = 501):
     indicator.showErrorMessage = True
     _add_validation(ws, indicator, f"F2:H{end_row}")
     _add_table(ws, "TradeReasonLog", f"A1:I{end_row}")
+    return ws
+
+
+def _tracking_row_formulas(row: int, end_row: int) -> dict[int, str]:
+    daily = "每日跟踪"
+    plan = "止损计划"
+    formulas = {
+        3: (
+            f'=IF(B{row}="","",IFERROR(LOOKUP(2,1/'
+            f"('单次交易'!$A$2:$A$201=B{row}),"
+            "'单次交易'!$B$2:$B$201),\"\"))"
+        ),
+        14: (
+            f'=IF(B{row}="","",IFERROR(LOOKUP(2,1/'
+            f"('单次交易'!$A$2:$A$201=B{row}),"
+            "'单次交易'!$N$2:$N$201),\"\"))"
+        ),
+        15: (
+            f'=IF(A{row}<>"{daily}","",IF(OR(B{row}="",H{row}="",I{row}=""),"",'
+            f'MAXIFS($I$2:$I${end_row},$A$2:$A${end_row},"{daily}",'
+            f'$B$2:$B${end_row},B{row},$H$2:$H${end_row},"<="&H{row})))'
+        ),
+        16: (
+            f'=IF(A{row}<>"{daily}","",IF(O{row}="","",IFERROR('
+            f'MAXIFS($D$2:$D${end_row},$A$2:$A${end_row},"{plan}",'
+            f'$B$2:$B${end_row},B{row},$E$2:$E${end_row},"<="&O{row}),0)))'
+        ),
+        17: (
+            f'=IF(A{row}<>"{daily}","",IF(N{row}="","",MAX(N{row},IFERROR('
+            f'MAXIFS($F$2:$F${end_row},$A$2:$A${end_row},"{plan}",'
+            f'$B$2:$B${end_row},B{row},$E$2:$E${end_row},"<="&O{row}),0))))'
+        ),
+        19: (
+            f'=IF(A{row}<>"{daily}","",IF(Q{row}="","",MAX(Q{row},IFERROR('
+            f'MAXIFS($R$2:$R${end_row},$A$2:$A${end_row},"{daily}",'
+            f'$B$2:$B${end_row},B{row},$H$2:$H${end_row},"<="&H{row}),0))))'
+        ),
+        20: (
+            f'=IF(A{row}<>"{daily}","",IF(O{row}="","",IF('
+            f'COUNTIFS($A$2:$A${end_row},"{plan}",$B$2:$B${end_row},B{row},'
+            f'$E$2:$E${end_row},">"&O{row})=0,"",'
+            f'MINIFS($E$2:$E${end_row},$A$2:$A${end_row},"{plan}",'
+            f'$B$2:$B${end_row},B{row},$E$2:$E${end_row},">"&O{row}))))'
+        ),
+        21: (
+            f'=IF(OR(A{row}<>"{daily}",T{row}=""),"",IFERROR('
+            f'MAXIFS($F$2:$F${end_row},$A$2:$A${end_row},"{plan}",'
+            f'$B$2:$B${end_row},B{row},$E$2:$E${end_row},T{row}),""))'
+        ),
+        22: (
+            f'=IF(OR(A{row}<>"{daily}",T{row}="",I{row}="",I{row}<=0),"",'
+            f'T{row}/I{row}-1)'
+        ),
+        23: (
+            f'=IF(A{row}<>"{daily}","",IF(OR(I{row}="",S{row}=""),"",'
+            f'IF(I{row}<=S{row},"触发止损：应全部卖出","继续观察")))'
+        ),
+        26: (
+            f'=IF(X{row}<>"执行卖出","",IFERROR(LOOKUP(2,1/'
+            f"('单次交易'!$A$2:$A$201=B{row}),"
+            "'单次交易'!$H$2:$H$201),\"\"))"
+        ),
+        28: (
+            f'=IF(A{row}<>"{daily}","",IF(OR(B{row}="",H{row}="",I{row}="",'
+            f'J{row}="",K{row}="",L{row}="",M{row}=""),"待补充每日记录",'
+            f'IF(W{row}="触发止损：应全部卖出",IF(X{row}<>"执行卖出",'
+            f'"违规：触发止损但未执行",IF(Y{row}="","待补充实际卖出价",'
+            f'"卖出记录完整")),IF(X{row}="","待选择卖出动作",'
+            f'IF(X{row}="执行卖出",IF(Y{row}="","待补充实际卖出价",'
+            f'"卖出记录完整"),"正常")))))'
+        ),
+    }
+    plan_check = (
+        f'IF(OR(B{row}="",D{row}="",E{row}="",F{row}="",G{row}=""),"计划不完整",'
+        f'IF(OR(D{row}<1,D{row}<>INT(D{row})),"阶段序号无效",'
+        f'IF(COUNTIFS($A$2:$A${end_row},"{plan}",$B$2:$B${end_row},B{row},'
+        f'$D$2:$D${end_row},D{row})>1,"阶段序号重复",'
+        f'IF(E{row}<=IFERROR(LOOKUP(2,1/(\'单次交易\'!$A$2:$A$201=B{row}),'
+        "'单次交易'!$E$2:$E$201),0),\"激活价须高于买入价\","
+        f'IF(F{row}<N{row},"止损价不得低于初始止损",'
+        f'IF(F{row}>E{row},"止损价不得高于激活价",'
+        f'IF(AND(COUNTIFS($A$2:$A${end_row},"{plan}",$B$2:$B${end_row},B{row},'
+        f'$D$2:$D${end_row},"<"&D{row})>0,OR('
+        f'E{row}<=MAXIFS($E$2:$E${end_row},$A$2:$A${end_row},"{plan}",'
+        f'$B$2:$B${end_row},B{row},$D$2:$D${end_row},"<"&D{row}),'
+        f'F{row}<MAXIFS($F$2:$F${end_row},$A$2:$A${end_row},"{plan}",'
+        f'$B$2:$B${end_row},B{row},$D$2:$D${end_row},"<"&D{row}))),'
+        '"阶段价格必须逐级提高","计划有效")))))))'
+    )
+    daily_check = (
+        f'IF(OR(B{row}="",H{row}="",I{row}="",J{row}=""),"每日数据不完整",'
+        f'IF(COUNTIFS($A$2:$A${end_row},"{daily}",$B$2:$B${end_row},B{row},'
+        f'$H$2:$H${end_row},H{row})>1,"同一交易日期重复",'
+        f'IF(AND(R{row}<>"",R{row}<S{row}),"人工止损无效：不能下调","跟踪有效")))'
+    )
+    formulas[29] = (
+        f'=IF(A{row}="","",IF(A{row}="{plan}",{plan_check},'
+        f'IF(A{row}="{daily}",{daily_check},"记录类型无效")))'
+    )
+    return formulas
+
+
+def _build_tracking_sheet(
+    wb: Workbook,
+    end_row: int = 501,
+):
+    ws = wb.create_sheet("持仓跟踪", 1)
+    _apply_header(ws, TRACKING_HEADERS)
+    ws.freeze_panes = "D2"
+    manual_columns = {1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 18, 24, 25, 27}
+    for row in range(2, end_row + 1):
+        formulas = _tracking_row_formulas(row, end_row)
+        for column in range(1, len(TRACKING_HEADERS) + 1):
+            cell = ws.cell(row, column)
+            if column in formulas:
+                cell.value = formulas[column]
+            cell.fill = INPUT_FILL if column in manual_columns else FORMULA_FILL
+            cell.border = THIN_BORDER
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+        ws.cell(row, 8).number_format = "yyyy-mm-dd"
+        for column in (5, 6, 9, 14, 15, 17, 18, 19, 20, 21, 25, 27):
+            ws.cell(row, column).number_format = CURRENCY_FORMAT
+        ws.cell(row, 22).number_format = PERCENT_FORMAT
+        for column in (4, 10, 16, 26):
+            ws.cell(row, column).number_format = "0"
+
+    widths = {
+        1: 14, 2: 14, 3: 14, 4: 15, 5: 12, 6: 16, 7: 28,
+        8: 13, 9: 12, 10: 14, 11: 28, 12: 16, 13: 30,
+        14: 13, 15: 16, 16: 18, 17: 15, 18: 16, 19: 16,
+        20: 18, 21: 18, 22: 18, 23: 24, 24: 14, 25: 14,
+        26: 16, 27: 14, 28: 26, 29: 28,
+    }
+    for column, width in widths.items():
+        ws.column_dimensions[get_column_letter(column)].width = width
+
+    record_type = DataValidation(
+        type="list",
+        formula1='"止损计划,每日跟踪"',
+        allow_blank=True,
+    )
+    _add_validation(ws, record_type, f"A2:A{end_row}")
+    trade_id = DataValidation(type="list", formula1="=_TradeIds", allow_blank=True)
+    _add_validation(ws, trade_id, f"B2:B{end_row}")
+    stage_number = DataValidation(
+        type="whole",
+        operator="greaterThanOrEqual",
+        formula1="1",
+        allow_blank=True,
+    )
+    _add_validation(ws, stage_number, f"D2:D{end_row}")
+    positive_value = DataValidation(
+        type="decimal",
+        operator="greaterThan",
+        formula1="0",
+        allow_blank=True,
+    )
+    _add_validation(ws, positive_value, f"E2:F{end_row} I2:J{end_row} R2:R{end_row} Y2:Y{end_row}")
+    record_date = DataValidation(
+        type="date",
+        operator="between",
+        formula1="DATE(2000,1,1)",
+        formula2="DATE(2100,12,31)",
+        allow_blank=True,
+    )
+    _add_validation(ws, record_date, f"H2:H{end_row}")
+    market_stage = DataValidation(
+        type="list",
+        formula1='"吸筹,启动,趋势上行,加速上涨,高位分歧,回调确认,破位,其他"',
+        allow_blank=True,
+    )
+    _add_validation(ws, market_stage, f"L2:L{end_row}")
+    sell_action = DataValidation(
+        type="list",
+        formula1='"继续持有,执行卖出"',
+        allow_blank=True,
+    )
+    _add_validation(ws, sell_action, f"X2:X{end_row}")
+    sell_fee = DataValidation(
+        type="decimal",
+        operator="greaterThanOrEqual",
+        formula1="0",
+        allow_blank=True,
+    )
+    _add_validation(ws, sell_fee, f"AA2:AA{end_row}")
+    ws.conditional_formatting.add(
+        f"A2:AC{end_row}",
+        FormulaRule(formula=['$A2="止损计划"'], fill=YELLOW_FILL),
+    )
+    ws.conditional_formatting.add(
+        f"W2:W{end_row}",
+        FormulaRule(formula=['LEFT($W2,4)="触发止损"'], fill=RED_FILL),
+    )
+    ws.conditional_formatting.add(
+        f"AB2:AC{end_row}",
+        FormulaRule(
+            formula=['OR(LEFT($AB2,2)="违规",ISNUMBER(SEARCH("无效",$AC2)))'],
+            fill=RED_FILL,
+        ),
+    )
+    _add_table(ws, "PositionTracking", f"A1:AC{end_row}")
+    ws.sheet_view.showGridLines = False
     return ws
 
 
@@ -1206,12 +1724,563 @@ def append_reason_to_workbook(
 def _populate_sample_data(wb: Workbook, as_of_date: date) -> None:
     wb["账户数据"]["B2"] = 100_000
     wb["目标收益"]["B3"] = 0.10
+    tracking = wb["持仓跟踪"]
     for row, item in enumerate(
         generate_sample_transactions(as_of_date),
         start=2,
     ):
         append_trade_to_workbook(wb, item, row)
         append_reason_to_workbook(wb, item, row)
+        tracking.cell(row, 1).value = "止损计划"
+        tracking.cell(row, 2).value = item["trade_id"]
+        tracking.cell(row, 4).value = 1
+        tracking.cell(row, 5).value = item["expected_sell_price"]
+        tracking.cell(row, 6).value = item["buy_price"]
+        tracking.cell(row, 7).value = "达到首个目标后把止损提高到买入价"
+        expectation_type = TRADE_EXPECTATION_TYPES[(row - 2) % 3]
+        matching_period = {
+            "短期博反弹": "4～10个交易日",
+            "突破冲新高": "11～20个交易日",
+            "趋势波段": "21～60个交易日",
+        }[expectation_type]
+        wb["单次交易"].cell(row, 33).value = expectation_type
+        wb["单次交易"].cell(row, 34).value = matching_period
+        wb["单次交易"].cell(row, 35).value = (
+            f"{expectation_type}样本：按预设周期验证交易计划"
+        )
+
+
+def _consecutive_loss_alert_formula(
+    row: int,
+    require_stop_plan: bool = False,
+    require_expectation: bool = False,
+) -> str:
+    allowed_check = (
+        f'IF(\'账户数据\'!$B$23="接近锁仓",'
+        '"允许开仓（接近锁仓）","允许开仓")'
+    )
+    if require_expectation:
+        allowed_check = (
+            f'IF(AJ{row}="周期与交易预期不匹配，请重新确认",'
+            f'IF(\'账户数据\'!$B$23="接近锁仓",'
+            '"允许开仓（接近锁仓；周期需复核）","允许开仓（周期需复核）"),'
+            f'IF(\'账户数据\'!$B$23="接近锁仓",'
+            '"允许开仓（接近锁仓）","允许开仓"))'
+        )
+    risk_check = (
+        f"IF('账户数据'!$B$9+F{row}*(E{row}-N{row})"
+        ">='账户数据'!$B$7,"
+        '"禁止开仓：风险额度不足",'
+        f'{allowed_check})'
+    )
+    opening_check = risk_check
+    if require_stop_plan:
+        opening_check = (
+            "IF(COUNTIFS('持仓跟踪'!$A$2:$A$501,\"止损计划\","
+            f"'持仓跟踪'!$B$2:$B$501,A{row},"
+            "'持仓跟踪'!$AC$2:$AC$501,\"计划有效\")=0,"
+            f'"禁止开仓：请先填写止损计划",{risk_check})'
+        )
+    if require_expectation:
+        opening_check = (
+            f'IF(OR(AG{row}="",AH{row}="",AI{row}=""),'
+            f'"禁止开仓：交易预期未填写完整",{opening_check})'
+        )
+    return (
+        f'=IF(A{row}="","",IF(H{row}<>"","已开仓",'
+        f'IF(\'账户数据\'!$B$23="已锁仓",'
+        '"禁止开仓：连续亏损达到上限",'
+        f'IF(\'账户数据\'!$B$23="解锁信息不完整",'
+        '"禁止开仓：请完整填写解锁信息",'
+        f'IF(OR(F{row}="",E{row}="",N{row}="",E{row}<=N{row},'
+        "'账户数据'!$B$7=\"\"),\"\","
+        f"{opening_check})))))"
+    )
+
+
+def apply_consecutive_loss_lock(
+    wb: Workbook,
+    end_row: int = 201,
+) -> Workbook:
+    """Add formula-only consecutive-loss locking to an existing workbook."""
+    account = wb["账户数据"]
+    trade = wb["单次交易"]
+    controls = {
+        13: (
+            "连续亏损锁仓比例",
+            0.06,
+            "从最近盈利或有效手动解锁后的下一笔开始累计；默认6%",
+        ),
+        14: (
+            "最近盈利记录序号",
+            '=IFERROR(LOOKUP(2,1/((\'单次交易\'!$M$2:$M$201<>"")*'
+            '(\'单次交易\'!$X$2:$X$201>0)),'
+            "ROW('单次交易'!$X$2:$X$201)-1),0)",
+            "按工作表记录顺序查找最近一笔已平仓盈利交易",
+        ),
+        15: (
+            "最近已完成记录序号",
+            '=IFERROR(LOOKUP(2,1/(\'单次交易\'!$M$2:$M$201<>""),'
+            "ROW('单次交易'!$M$2:$M$201)-1),0)",
+            "按工作表记录顺序查找最后一笔已平仓交易",
+        ),
+        16: (
+            "手动解锁截至记录序号",
+            None,
+            "锁仓复盘后填写当前最近已完成记录序号；须同时填写解锁原因",
+        ),
+        17: (
+            "手动解锁原因",
+            None,
+            "例如：已完成复盘，开始新的模拟周期",
+        ),
+        18: (
+            "当前周期起点序号",
+            '=MAX(B14,IF(AND(ISNUMBER(B16),B16>=1,B16<=B15,B17<>""),B16,0))',
+            "取最近盈利序号与有效手动解锁序号中的较大值",
+        ),
+        19: (
+            "周期起点账户金额",
+            '=IF(B2="","",IF(B18=0,B2,B2+'
+            "SUM('单次交易'!$X$2:INDEX('单次交易'!$X:$X,B18+1))))",
+            "初始金额加上周期起点及以前的全部已实现盈亏",
+        ),
+        20: (
+            "当前周期累计亏损",
+            '=IF(B18>=B15,0,-SUMPRODUCT('
+            "(ROW('单次交易'!$X$2:$X$201)-1>B18)*"
+            "('单次交易'!$M$2:$M$201<>\"\")*"
+            "(IFERROR('单次交易'!$X$2:$X$201,0)<0)*"
+            "IFERROR('单次交易'!$X$2:$X$201,0)))",
+            "仅累计周期起点之后的已平仓亏损；盈利会自动成为新起点",
+        ),
+        21: (
+            "连续亏损比例",
+            '=IF(OR(B19="",B19<=0),"",B20/B19)',
+            "当前周期累计亏损÷周期起点账户金额",
+        ),
+        22: (
+            "锁仓风险使用率",
+            '=IF(OR(B13="",B13<=0,B21=""),"",B21/B13)',
+            "达到80%预警，达到100%锁仓",
+        ),
+        23: (
+            "连续亏损锁仓状态",
+            '=IF(OR(AND(B16<>"",B17=""),AND(B16="",B17<>""),'
+            'AND(B16<>"",OR(NOT(ISNUMBER(B16)),B16<1,B16>B15,B16<>INT(B16)))),'
+            '"解锁信息不完整",IF(B22>=1,"已锁仓",'
+            'IF(B22>=0.8,"接近锁仓","正常")))',
+            "锁仓时禁止新开仓；有效手动解锁后从下一笔重新累计",
+        ),
+    }
+    for row, values in controls.items():
+        for column, value in enumerate(values, start=1):
+            account.cell(row, column).value = value
+    _style_panel(account)
+    for cell in ("B13", "B16", "B17"):
+        account[cell].fill = INPUT_FILL
+    for cell in (
+        "B14",
+        "B15",
+        "B18",
+        "B19",
+        "B20",
+        "B21",
+        "B22",
+        "B23",
+    ):
+        account[cell].fill = FORMULA_FILL
+    account["B13"].number_format = PERCENT_FORMAT
+    account["B19"].number_format = CURRENCY_FORMAT
+    account["B20"].number_format = CURRENCY_FORMAT
+    account["B21"].number_format = PERCENT_FORMAT
+    account["B22"].number_format = PERCENT_FORMAT
+    for cell in ("B14", "B15", "B16", "B18"):
+        account[cell].number_format = "0"
+
+    lock_rate = DataValidation(
+        type="decimal",
+        operator="between",
+        formula1="0",
+        formula2="1",
+        allow_blank=False,
+    )
+    _add_validation(account, lock_rate, "B13")
+    unlock_sequence = DataValidation(
+        type="custom",
+        formula1='=OR(B16="",AND(ISNUMBER(B16),B16=INT(B16),B16>=1,B16<=B15))',
+        allow_blank=True,
+    )
+    unlock_sequence.errorTitle = "解锁序号无效"
+    unlock_sequence.error = "请填写1到最近已完成记录序号之间的整数，并同时填写解锁原因"
+    unlock_sequence.showErrorMessage = True
+    _add_validation(account, unlock_sequence, "B16")
+    account.conditional_formatting.add(
+        "B23",
+        FormulaRule(formula=['$B$23="已锁仓"'], fill=RED_FILL),
+    )
+    account.conditional_formatting.add(
+        "B23",
+        FormulaRule(
+            formula=['OR($B$23="接近锁仓",$B$23="解锁信息不完整")'],
+            fill=YELLOW_FILL,
+        ),
+    )
+    account.conditional_formatting.add(
+        "B23",
+        FormulaRule(formula=['$B$23="正常"'], fill=GREEN_FILL),
+    )
+
+    if "_LockStatus" in wb.defined_names:
+        del wb.defined_names["_LockStatus"]
+    wb.defined_names.add(
+        DefinedName("_LockStatus", attr_text="'账户数据'!$B$23")
+    )
+    for row in range(2, end_row + 1):
+        trade.cell(row, 7).value = _consecutive_loss_alert_formula(row)
+
+    trade.data_validations.dataValidation = [
+        validation
+        for validation in trade.data_validations.dataValidation
+        if f"H2:H{end_row}" not in str(validation.sqref)
+    ]
+    actual_shares = DataValidation(
+        type="custom",
+        formula1=(
+            '=OR(H2="",AND(_LockStatus<>"已锁仓",'
+            '_LockStatus<>"解锁信息不完整",ISNUMBER(H2),'
+            'H2>0,MOD(H2,100)=0))'
+        ),
+        allow_blank=True,
+    )
+    actual_shares.errorTitle = "当前禁止开仓或股数无效"
+    actual_shares.error = (
+        "请先完成解锁，并确保实际买入股数为大于0的100股整数倍"
+    )
+    actual_shares.showErrorMessage = True
+    _add_validation(trade, actual_shares, f"H2:H{end_row}")
+    trade.conditional_formatting.add(
+        f"G2:G{end_row}",
+        FormulaRule(
+            formula=['LEFT($G2,4)="禁止开仓"'],
+            fill=RED_FILL,
+        ),
+    )
+    trade.conditional_formatting.add(
+        f"G2:G{end_row}",
+        FormulaRule(
+            formula=['$G2="允许开仓（接近锁仓）"'],
+            fill=YELLOW_FILL,
+        ),
+    )
+    trade.conditional_formatting.add(
+        f"G2:G{end_row}",
+        FormulaRule(formula=['$G2="允许开仓"'], fill=GREEN_FILL),
+    )
+    account.sheet_view.showGridLines = False
+    wb.active = wb.sheetnames.index("账户数据")
+    wb.calculation.calcMode = "auto"
+    wb.calculation.fullCalcOnLoad = True
+    wb.calculation.forceFullCalc = True
+    return wb
+
+
+def upgrade_workbook_with_consecutive_loss_lock(
+    source: str | Path,
+    destination: str | Path,
+) -> Path:
+    """Preserve workbook data while adding the formula-only lock controls."""
+    source_path = Path(source)
+    destination_path = Path(destination)
+    workbook = load_workbook(source_path, data_only=False)
+    apply_consecutive_loss_lock(workbook)
+    workbook.save(destination_path)
+    return destination_path
+
+
+def _tracking_sell_lookup_formula(
+    trade_row: int,
+    tracking_column: str,
+) -> str:
+    return (
+        f'=IF(A{trade_row}="","",IFERROR(LOOKUP(2,1/'
+        f"(('持仓跟踪'!$B$2:$B$501=A{trade_row})*"
+        "('持仓跟踪'!$X$2:$X$501=\"执行卖出\")*"
+        f"('持仓跟踪'!${tracking_column}$2:${tracking_column}$501<>\"\")),"
+        f"'持仓跟踪'!${tracking_column}$2:${tracking_column}$501),\"\"))"
+    )
+
+
+def apply_dynamic_stop_tracking(
+    wb: Workbook,
+    tracking_end_row: int = 501,
+    trade_end_row: int = 201,
+) -> Workbook:
+    """Add the combined stop-plan and daily position-tracking workflow."""
+    if "持仓跟踪" in wb.sheetnames:
+        raise ValueError("持仓跟踪工作表已存在；为避免覆盖数据，不重复创建")
+    tracking = _build_tracking_sheet(wb, tracking_end_row)
+    trade = wb["单次交易"]
+
+    for name, reference in {
+        "_TradeIds": "'单次交易'!$A$2:$A$201",
+        "_TrackType": "'持仓跟踪'!$A$2:$A$501",
+        "_TrackTradeId": "'持仓跟踪'!$B$2:$B$501",
+        "_TrackRule": "'持仓跟踪'!$AC$2:$AC$501",
+    }.items():
+        if name in wb.defined_names:
+            del wb.defined_names[name]
+        wb.defined_names.add(DefinedName(name, attr_text=reference))
+
+    for row in range(2, trade_end_row + 1):
+        trade.cell(row, 7).value = _consecutive_loss_alert_formula(
+            row,
+            require_stop_plan=True,
+        )
+    trade.data_validations.dataValidation = [
+        validation
+        for validation in trade.data_validations.dataValidation
+        if f"H2:H{trade_end_row}" not in str(validation.sqref)
+    ]
+    actual_shares = DataValidation(
+        type="custom",
+        formula1=(
+            '=OR(H2="",AND(_LockStatus<>"已锁仓",'
+            '_LockStatus<>"解锁信息不完整",'
+            'COUNTIFS(_TrackType,"止损计划",_TrackTradeId,A2,'
+            '_TrackRule,"计划有效")>0,ISNUMBER(H2),H2>0,'
+            'MOD(H2,100)=0))'
+        ),
+        allow_blank=True,
+    )
+    actual_shares.errorTitle = "当前禁止开仓、止损计划缺失或股数无效"
+    actual_shares.error = (
+        "请先完成有效止损计划及解锁，并确保股数为大于0的100股整数倍"
+    )
+    actual_shares.showErrorMessage = True
+    _add_validation(trade, actual_shares, f"H2:H{trade_end_row}")
+
+    existing_rows = [
+        row
+        for row in range(2, trade_end_row + 1)
+        if trade.cell(row, 1).value not in (None, "")
+    ]
+    first_future_row = max(existing_rows, default=1) + 1
+    for row in range(first_future_row, trade_end_row + 1):
+        trade.cell(row, 11).value = _tracking_sell_lookup_formula(row, "Y")
+        trade.cell(row, 12).value = _tracking_sell_lookup_formula(row, "Z")
+        trade.cell(row, 13).value = _tracking_sell_lookup_formula(row, "H")
+        trade.cell(row, 16).value = _tracking_sell_lookup_formula(row, "AA")
+        for column in (11, 12, 13, 16):
+            trade.cell(row, column).fill = FORMULA_FILL
+
+    trade["G1"].comment = Comment(
+        "开仓前必须在“持仓跟踪”填写至少一条规则有效的止损计划；"
+        "同时检查连续亏损锁仓和原有风险额度。",
+        "Codex",
+    )
+    tracking["A1"].comment = Comment(
+        "同一张表同时记录止损计划和每日跟踪；先选择记录类型，再填写对应的蓝色输入列。",
+        "Codex",
+    )
+    tracking["S1"].comment = Comment(
+        "当前有效止损取初始止损、已激活计划止损和历次人工上调止损的最大值，只升不降。",
+        "Codex",
+    )
+    wb.active = wb.sheetnames.index("持仓跟踪")
+    wb.calculation.calcMode = "auto"
+    wb.calculation.fullCalcOnLoad = True
+    wb.calculation.forceFullCalc = True
+    return wb
+
+
+def upgrade_workbook_with_dynamic_stop(
+    source: str | Path,
+    destination: str | Path,
+) -> Path:
+    """Preserve history and add the dynamic-stop tracking workflow."""
+    source_path = Path(source)
+    destination_path = Path(destination)
+    workbook = load_workbook(source_path, data_only=False)
+    apply_dynamic_stop_tracking(workbook)
+    workbook.save(destination_path)
+    return destination_path
+
+
+def _expectation_match_formula(row: int) -> str:
+    return (
+        f'=IF(OR(AG{row}="",AH{row}=""),"",IF(OR('
+        f'AND(AG{row}="短期博反弹",OR(AH{row}="1～3个交易日",'
+        f'AH{row}="4～10个交易日")),'
+        f'AND(AG{row}="突破冲新高",OR(AH{row}="4～10个交易日",'
+        f'AH{row}="11～20个交易日")),'
+        f'AND(AG{row}="趋势波段",OR(AH{row}="11～20个交易日",'
+        f'AH{row}="21～60个交易日",AH{row}="60个交易日以上"))),'
+        '"匹配","周期与交易预期不匹配，请重新确认"))'
+    )
+
+
+def apply_trade_expectation_fields(
+    wb: Workbook,
+    trade_end_row: int = 201,
+) -> Workbook:
+    """Require a trade thesis, holding range, and written rationale."""
+    trade = wb["单次交易"]
+    if trade["AG1"].value not in (None, ""):
+        raise ValueError("交易预期字段已存在；为避免覆盖数据，不重复创建")
+
+    if trade["AF1"].value in (None, ""):
+        trade["AF1"] = "备注"
+        trade["AF1"].fill = HEADER_FILL
+        trade["AF1"].font = HEADER_FONT
+        trade["AF1"].alignment = Alignment(
+            horizontal="center",
+            vertical="center",
+            wrap_text=True,
+        )
+        trade["AF1"].border = THIN_BORDER
+        for row in range(2, trade_end_row + 1):
+            trade.cell(row, 32).fill = INPUT_FILL
+            trade.cell(row, 32).border = THIN_BORDER
+            trade.cell(row, 32).alignment = Alignment(
+                vertical="top",
+                wrap_text=True,
+            )
+
+    expectation_headers = (
+        "交易预期类型",
+        "预期持有周期",
+        "预期选择理由",
+        "周期匹配检查",
+    )
+    for column, header in enumerate(expectation_headers, start=33):
+        cell = trade.cell(1, column)
+        cell.value = header
+        cell.fill = HEADER_FILL
+        cell.font = HEADER_FONT
+        cell.alignment = Alignment(
+            horizontal="center",
+            vertical="center",
+            wrap_text=True,
+        )
+        cell.border = THIN_BORDER
+    for row in range(2, trade_end_row + 1):
+        for column in (33, 34, 35):
+            trade.cell(row, column).fill = INPUT_FILL
+            trade.cell(row, column).border = THIN_BORDER
+            trade.cell(row, column).alignment = Alignment(
+                vertical="top",
+                wrap_text=True,
+            )
+        match_cell = trade.cell(row, 36)
+        match_cell.value = _expectation_match_formula(row)
+        match_cell.fill = FORMULA_FILL
+        match_cell.border = THIN_BORDER
+        match_cell.alignment = Alignment(vertical="top", wrap_text=True)
+
+    trade.column_dimensions["AF"].width = max(
+        trade.column_dimensions["AF"].width or 0,
+        20,
+    )
+    trade.column_dimensions["AG"].width = 18
+    trade.column_dimensions["AH"].width = 20
+    trade.column_dimensions["AI"].width = 42
+    trade.column_dimensions["AJ"].width = 32
+    expectation_type = DataValidation(
+        type="list",
+        formula1='"短期博反弹,突破冲新高,趋势波段"',
+        allow_blank=True,
+    )
+    expectation_type.errorTitle = "交易预期无效"
+    expectation_type.error = "请从短期博反弹、突破冲新高、趋势波段中选择"
+    expectation_type.showErrorMessage = True
+    _add_validation(trade, expectation_type, f"AG2:AG{trade_end_row}")
+    holding_period = DataValidation(
+        type="list",
+        formula1=(
+            '"1～3个交易日,4～10个交易日,11～20个交易日,'
+            '21～60个交易日,60个交易日以上"'
+        ),
+        allow_blank=True,
+    )
+    holding_period.errorTitle = "预期持有周期无效"
+    holding_period.error = "请从预设的交易日范围中选择"
+    holding_period.showErrorMessage = True
+    _add_validation(trade, holding_period, f"AH2:AH{trade_end_row}")
+    trade.conditional_formatting.add(
+        f"AJ2:AJ{trade_end_row}",
+        FormulaRule(
+            formula=['$AJ2="周期与交易预期不匹配，请重新确认"'],
+            fill=YELLOW_FILL,
+        ),
+    )
+    trade.conditional_formatting.add(
+        f"AJ2:AJ{trade_end_row}",
+        FormulaRule(formula=['$AJ2="匹配"'], fill=GREEN_FILL),
+    )
+
+    for row in range(2, trade_end_row + 1):
+        trade.cell(row, 7).value = _consecutive_loss_alert_formula(
+            row,
+            require_stop_plan=True,
+            require_expectation=True,
+        )
+    trade.data_validations.dataValidation = [
+        validation
+        for validation in trade.data_validations.dataValidation
+        if f"H2:H{trade_end_row}" not in str(validation.sqref)
+    ]
+    actual_shares = DataValidation(
+        type="custom",
+        formula1=(
+            '=OR(H2="",AND(_LockStatus<>"已锁仓",'
+            '_LockStatus<>"解锁信息不完整",AG2<>"",AH2<>"",AI2<>"",'
+            'COUNTIFS(_TrackType,"止损计划",_TrackTradeId,A2,'
+            '_TrackRule,"计划有效")>0,ISNUMBER(H2),H2>0,'
+            'MOD(H2,100)=0))'
+        ),
+        allow_blank=True,
+    )
+    actual_shares.errorTitle = "交易计划不完整、当前禁止开仓或股数无效"
+    actual_shares.error = (
+        "请填写交易预期、持有周期、选择理由和有效止损计划，"
+        "完成解锁，并确保股数为大于0的100股整数倍"
+    )
+    actual_shares.showErrorMessage = True
+    _add_validation(trade, actual_shares, f"H2:H{trade_end_row}")
+
+    table = next(iter(trade.tables.values()))
+    existing_column_count = len(table.tableColumns)
+    for column in range(existing_column_count + 1, 37):
+        table.tableColumns.append(
+            TableColumn(id=column, name=str(trade.cell(1, column).value))
+        )
+    table.ref = f"A1:AJ{trade_end_row}"
+    if table.autoFilter is not None:
+        table.autoFilter.ref = table.ref
+    trade["AG1"].comment = Comment(
+        "开仓前必选：短期博反弹、突破冲新高或趋势波段。"
+        "同时必须选择预期持有周期并填写选择理由。",
+        "Codex",
+    )
+    wb.active = wb.sheetnames.index("单次交易")
+    wb.calculation.calcMode = "auto"
+    wb.calculation.fullCalcOnLoad = True
+    wb.calculation.forceFullCalc = True
+    return wb
+
+
+def upgrade_workbook_with_trade_expectations(
+    source: str | Path,
+    destination: str | Path,
+) -> Path:
+    """Preserve V3 data and add mandatory trade-expectation fields."""
+    source_path = Path(source)
+    destination_path = Path(destination)
+    workbook = load_workbook(source_path, data_only=False)
+    apply_trade_expectation_fields(workbook)
+    workbook.save(destination_path)
+    return destination_path
 
 
 def build_workbook(
@@ -1227,6 +2296,9 @@ def build_workbook(
     _build_account_sheet(wb)
     _build_target_sheet(wb)
     _build_technical_indicator_sheet(wb)
+    apply_consecutive_loss_lock(wb)
+    apply_dynamic_stop_tracking(wb)
+    apply_trade_expectation_fields(wb)
     wb.calculation.calcMode = "auto"
     wb.calculation.fullCalcOnLoad = True
     wb.calculation.forceFullCalc = True
