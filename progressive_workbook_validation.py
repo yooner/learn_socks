@@ -19,6 +19,15 @@ import trading_workbook as tw
 
 def _metric_record(item: Mapping[str, Any]) -> dict[str, Any]:
     shares = item["actual_buy_shares"]
+    position = tw.calculate_tranche_position(
+        [
+            (item["buy_price"], shares),
+            (None, None),
+            (None, None),
+        ],
+        item["stop_price"],
+        is_closed=item["sell_date"] is not None,
+    )
     pnl = None
     return_rate = None
     account_return = None
@@ -60,6 +69,12 @@ def _metric_record(item: Mapping[str, Any]) -> dict[str, Any]:
         "buy_price": item["buy_price"],
         "stop_price": item["stop_price"],
         "actual_buy_shares": shares,
+        "buy_amount": (
+            position["buy_amount"] if shares is not None else None
+        ),
+        "weighted_buy_price": position["weighted_buy_price"],
+        "total_shares": position["total_shares"],
+        "current_risk": position["current_risk"],
     }
 
 
@@ -169,6 +184,34 @@ def _inspect_step(
             trade.cell(row, 8).value,
             current_item["actual_buy_shares"],
         ),
+        "weighted buy price": (
+            trade.cell(row, 41).value,
+            current_metric["weighted_buy_price"],
+        ),
+        "cumulative shares": (
+            trade.cell(row, 42).value,
+            (
+                current_metric["total_shares"]
+                if current_item["actual_buy_shares"] is not None
+                else None
+            ),
+        ),
+        "current position risk": (
+            trade.cell(row, 43).value,
+            (
+                current_metric["current_risk"]
+                if current_item["actual_buy_shares"] is not None
+                else None
+            ),
+        ),
+        "tranche rule check": (
+            trade.cell(row, 44).value,
+            (
+                "通过"
+                if current_item["actual_buy_shares"] is not None
+                else "违规：第一批价格或股数缺失"
+            ),
+        ),
         "realized pnl": (
             trade.cell(row, 24).value,
             current_metric["pnl"],
@@ -226,6 +269,14 @@ def _inspect_step(
         "open_positions": open_count,
         "suggested_shares": current_item["suggested_shares"],
         "actual_shares": current_item["actual_buy_shares"],
+        "weighted_buy_price": current_metric["weighted_buy_price"],
+        "cumulative_shares": current_metric["total_shares"],
+        "current_position_risk": current_metric["current_risk"],
+        "tranche_rule_check": (
+            "通过"
+            if current_item["actual_buy_shares"] is not None
+            else "违规：第一批价格或股数缺失"
+        ),
         "pnl": current_metric["pnl"],
         "balance": current_balance,
         "open_risk": open_risk,
@@ -354,6 +405,13 @@ def run_progressive_validation(
             row = step + 1
             tw.append_trade_to_workbook(workbook, item, row)
             tw.append_reason_to_workbook(workbook, item, row)
+            tracking = workbook["持仓跟踪"]
+            tracking.cell(row, 1).value = "止损计划"
+            tracking.cell(row, 2).value = item["trade_id"]
+            tracking.cell(row, 4).value = 1
+            tracking.cell(row, 5).value = item["expected_sell_price"]
+            tracking.cell(row, 6).value = item["buy_price"]
+            tracking.cell(row, 7).value = "达到首个目标后把止损提高到买入价"
             workbook.save(source)
             latest_recalculated = _recalculate_with_libreoffice(
                 source,

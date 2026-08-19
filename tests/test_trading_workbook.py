@@ -576,6 +576,55 @@ class CalculationTests(unittest.TestCase):
         )
         self.assertGreater(sample_summary["expectancy"], 0)
 
+    def test_sample_metrics_expose_cumulative_position_values(self):
+        items = tw.generate_sample_transactions(
+            as_of_date=date(2026, 7, 24),
+            count=100,
+        )
+        metrics = tw.sample_trade_metrics(date(2026, 7, 24))
+        open_index = next(
+            index
+            for index, item in enumerate(items)
+            if item["actual_buy_shares"] is not None
+            and item["sell_date"] is None
+        )
+        item = items[open_index]
+        metric = metrics[open_index]
+
+        expected_amount = item["buy_price"] * item["actual_buy_shares"]
+        expected_risk = max(
+            item["buy_price"] - item["stop_price"],
+            0,
+        ) * item["actual_buy_shares"]
+        self.assertEqual(metric["buy_amount"], expected_amount)
+        self.assertEqual(metric["weighted_buy_price"], item["buy_price"])
+        self.assertEqual(
+            metric["total_shares"],
+            item["actual_buy_shares"],
+        )
+        self.assertEqual(metric["current_risk"], expected_risk)
+
+    def test_progressive_metric_record_uses_cumulative_position_contract(self):
+        validator = importlib.import_module("progressive_workbook_validation")
+        item = {
+            "buy_price": 10.0,
+            "actual_buy_shares": 500,
+            "stop_price": 9.0,
+            "sell_price": None,
+            "sell_date": None,
+            "buy_fee": 5.0,
+            "sell_fee": 0.0,
+            "account_snapshot": 100_000.0,
+            "buy_date": date(2026, 7, 1),
+        }
+
+        metric = validator._metric_record(item)
+
+        self.assertEqual(metric["buy_amount"], 5_000.0)
+        self.assertEqual(metric["weighted_buy_price"], 10.0)
+        self.assertEqual(metric["total_shares"], 500)
+        self.assertEqual(metric["current_risk"], 500.0)
+
     def test_append_trade_writes_only_one_requested_row(self):
         workbook = tw.build_workbook(with_sample_data=False)
         item = tw.generate_sample_transactions(
@@ -1106,6 +1155,51 @@ class IntegrationTests(unittest.TestCase):
             self.assertEqual(trade["AJ1"].value, "周期匹配检查")
             self.assertIsNone(trade["AG2"].value)
             self.assertEqual(next(iter(trade.tables.values())).ref, "A1:AJ201")
+
+    def test_three_tranche_upgrade_preserves_v4_history(self):
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "交易管理系统_V4_交易预期.xlsx"
+        )
+        before = load_workbook(source, data_only=False)
+        before_trade = before["单次交易"]
+        historical_values = {
+            coordinate: before_trade[coordinate].value
+            for coordinate in (
+                "A2",
+                "E2",
+                "H2",
+                "I2",
+                "O2",
+                "AG2",
+                "AJ2",
+                "AF38",
+            )
+        }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "交易管理系统_V5_三批买入.xlsx"
+            result = tw.upgrade_workbook_with_three_tranche_buying(
+                source,
+                destination,
+            )
+
+            after = load_workbook(result, data_only=False)
+            trade = after["单次交易"]
+            for coordinate, expected in historical_values.items():
+                self.assertEqual(trade[coordinate].value, expected)
+            self.assertIsNone(trade["AK2"].value)
+            self.assertIsNone(trade["AL2"].value)
+            self.assertIsNone(trade["AM2"].value)
+            self.assertIsNone(trade["AN2"].value)
+            self.assertEqual(trade["E1"].value, "第一批买入价")
+            self.assertEqual(trade["AR1"].value, "分仓规则检查")
+            self.assertEqual(
+                next(iter(trade.tables.values())).ref,
+                "A1:AR201",
+            )
+            self.assertEqual(after.active.title, "单次交易")
+            self.assertEqual(after.sheetnames, before.sheetnames)
 
     def _recalculate_with_libreoffice(self, source: Path, output_dir: Path) -> Path:
         soffice = shutil.which("soffice")

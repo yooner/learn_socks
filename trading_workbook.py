@@ -1630,6 +1630,15 @@ def sample_trade_metrics(as_of_date: date) -> list[dict[str, Any]]:
     result = []
     for item in generate_sample_transactions(as_of_date):
         shares = item["actual_buy_shares"]
+        position = calculate_tranche_position(
+            [
+                (item["buy_price"], shares),
+                (None, None),
+                (None, None),
+            ],
+            item["stop_price"],
+            is_closed=item["sell_date"] is not None,
+        )
         pnl = None
         return_rate = None
         account_return = None
@@ -1674,6 +1683,12 @@ def sample_trade_metrics(as_of_date: date) -> list[dict[str, Any]]:
                 "buy_price": item["buy_price"],
                 "stop_price": item["stop_price"],
                 "actual_buy_shares": shares,
+                "buy_amount": (
+                    position["buy_amount"] if shares is not None else None
+                ),
+                "weighted_buy_price": position["weighted_buy_price"],
+                "total_shares": position["total_shares"],
+                "current_risk": position["current_risk"],
             }
         )
     return result
@@ -2599,6 +2614,19 @@ def upgrade_workbook_with_trade_expectations(
     destination_path = Path(destination)
     workbook = load_workbook(source_path, data_only=False)
     apply_trade_expectation_fields(workbook)
+    workbook.save(destination_path)
+    return destination_path
+
+
+def upgrade_workbook_with_three_tranche_buying(
+    source: str | Path,
+    destination: str | Path,
+) -> Path:
+    """Preserve V4 history and add the fixed three-batch workflow."""
+    source_path = Path(source)
+    destination_path = Path(destination)
+    workbook = load_workbook(source_path, data_only=False)
+    apply_three_tranche_buying(workbook)
     workbook.save(destination_path)
     return destination_path
 
