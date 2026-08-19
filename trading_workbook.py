@@ -1062,8 +1062,7 @@ def _build_reason_sheet(wb: Workbook, end_row: int = 501):
 def _tracking_row_formulas(row: int, end_row: int) -> dict[int, str]:
     daily = "每日跟踪"
     plan = "止损计划"
-    history_high = _aggregate_extreme_formula(
-        14,
+    history_high = _conditional_max_formula(
         f"$I$2:$I${end_row}",
         (
             f'$A$2:$A${end_row}="{daily}"',
@@ -1071,8 +1070,7 @@ def _tracking_row_formulas(row: int, end_row: int) -> dict[int, str]:
             f"$H$2:$H${end_row}<=H{row}",
         ),
     )
-    activated_stage = _aggregate_extreme_formula(
-        14,
+    activated_stage = _conditional_max_formula(
         f"$D$2:$D${end_row}",
         (
             f'$A$2:$A${end_row}="{plan}"',
@@ -1080,8 +1078,7 @@ def _tracking_row_formulas(row: int, end_row: int) -> dict[int, str]:
             f"$E$2:$E${end_row}<=O{row}",
         ),
     )
-    activated_stop = _aggregate_extreme_formula(
-        14,
+    activated_stop = _conditional_max_formula(
         f"$F$2:$F${end_row}",
         (
             f'$A$2:$A${end_row}="{plan}"',
@@ -1089,8 +1086,7 @@ def _tracking_row_formulas(row: int, end_row: int) -> dict[int, str]:
             f"$E$2:$E${end_row}<=O{row}",
         ),
     )
-    raised_stop = _aggregate_extreme_formula(
-        14,
+    raised_stop = _conditional_max_formula(
         f"$R$2:$R${end_row}",
         (
             f'$A$2:$A${end_row}="{daily}"',
@@ -1098,26 +1094,13 @@ def _tracking_row_formulas(row: int, end_row: int) -> dict[int, str]:
             f"$H$2:$H${end_row}<=H{row}",
         ),
     )
-    next_activation = _aggregate_extreme_formula(
-        15,
-        f"$E$2:$E${end_row}",
-        (
-            f'$A$2:$A${end_row}="{plan}"',
-            f"$B$2:$B${end_row}=B{row}",
-            f"$E$2:$E${end_row}>O{row}",
-        ),
+    next_activation = (
+        f'INDEX($E$2:$E${end_row},MATCH(1,INDEX('
+        f'($A$2:$A${end_row}="{plan}")*'
+        f'($B$2:$B${end_row}=B{row})*'
+        f'($E$2:$E${end_row}>O{row}),0),0))'
     )
-    next_stop = _aggregate_extreme_formula(
-        14,
-        f"$F$2:$F${end_row}",
-        (
-            f'$A$2:$A${end_row}="{plan}"',
-            f"$B$2:$B${end_row}=B{row}",
-            f"$E$2:$E${end_row}=T{row}",
-        ),
-    )
-    prior_activation = _aggregate_extreme_formula(
-        14,
+    prior_activation = _conditional_max_formula(
         f"$E$2:$E${end_row}",
         (
             f'$A$2:$A${end_row}="{plan}"',
@@ -1125,8 +1108,7 @@ def _tracking_row_formulas(row: int, end_row: int) -> dict[int, str]:
             f"$D$2:$D${end_row}<D{row}",
         ),
     )
-    prior_stop = _aggregate_extreme_formula(
-        14,
+    prior_stop = _conditional_max_formula(
         f"$F$2:$F${end_row}",
         (
             f'$A$2:$A${end_row}="{plan}"',
@@ -1169,7 +1151,8 @@ def _tracking_row_formulas(row: int, end_row: int) -> dict[int, str]:
         ),
         21: (
             f'=IF(OR(A{row}<>"{daily}",T{row}=""),"",IFERROR('
-            f'{next_stop},""))'
+            f'SUMIFS($F$2:$F${end_row},$A$2:$A${end_row},"{plan}",'
+            f'$B$2:$B${end_row},B{row},$E$2:$E${end_row},T{row}),""))'
         ),
         22: (
             f'=IF(OR(A{row}<>"{daily}",T{row}="",I{row}="",I{row}<=0),"",'
@@ -2100,17 +2083,13 @@ def _tracking_sell_lookup_formula(
     )
 
 
-def _aggregate_extreme_formula(
-    function_number: int,
+def _conditional_max_formula(
     value_range: str,
     criteria: Iterable[str],
 ) -> str:
-    """Build an Excel 2016/WPS-compatible conditional MIN/MAX formula."""
+    """Build a conditional maximum using only legacy worksheet functions."""
     condition_product = "*".join(f"({criterion})" for criterion in criteria)
-    return (
-        f"AGGREGATE({function_number},6,{value_range}/"
-        f"({condition_product}),1)"
-    )
+    return f"SUMPRODUCT(MAX(({condition_product})*{value_range}))"
 
 
 def apply_dynamic_stop_tracking(
@@ -2373,8 +2352,7 @@ def apply_trade_expectation_fields(
 
 
 def _effective_stop_formula(row: int, tracking_end_row: int = 501) -> str:
-    tracked_stop = _aggregate_extreme_formula(
-        14,
+    tracked_stop = _conditional_max_formula(
         f"'持仓跟踪'!$S$2:$S${tracking_end_row}",
         (
             f"'持仓跟踪'!$A$2:$A${tracking_end_row}=\"每日跟踪\"",

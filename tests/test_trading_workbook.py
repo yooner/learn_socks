@@ -732,9 +732,9 @@ class WorkbookStructureTests(unittest.TestCase):
             expected_headers,
         )
         self.assertEqual(tracking.freeze_panes, "D2")
-        self.assertIn("AGGREGATE(14,6", tracking["O2"].value)
-        self.assertIn("AGGREGATE(14,6", tracking["Q2"].value)
-        self.assertIn("AGGREGATE(14,6", tracking["S2"].value)
+        self.assertIn("SUMPRODUCT(MAX", tracking["O2"].value)
+        self.assertIn("SUMPRODUCT(MAX", tracking["Q2"].value)
+        self.assertIn("SUMPRODUCT(MAX", tracking["S2"].value)
         self.assertIn('"触发止损：应全部卖出"', tracking["W2"].value)
         self.assertIn('"执行卖出"', tracking["AB2"].value)
         self.assertIn("计划有效", tracking["AC2"].value)
@@ -807,7 +807,7 @@ class WorkbookStructureTests(unittest.TestCase):
         self.assertIn("AK2*AL2", trade["AO2"].value)
         self.assertIn("AM2*AN2", trade["AO2"].value)
         self.assertIn("H2+IF(AL2", trade["AP2"].value)
-        self.assertIn("AGGREGATE(14,6", trade["AQ2"].value)
+        self.assertIn("SUMPRODUCT(MAX", trade["AQ2"].value)
         self.assertIn(
             "'持仓跟踪'!$S$2:$S$501",
             trade["AQ2"].value,
@@ -831,7 +831,14 @@ class WorkbookStructureTests(unittest.TestCase):
                 self.assertTrue(Tokenizer(formula).items)
 
     def test_workbook_formulas_support_excel_2016_and_wps(self):
-        unsupported = ("MAXIFS(", "MINIFS(", "LET(", "XLOOKUP(", "FILTER(")
+        unsupported = (
+            "MAXIFS(",
+            "MINIFS(",
+            "AGGREGATE(",
+            "LET(",
+            "XLOOKUP(",
+            "FILTER(",
+        )
         incompatible_cells = []
 
         for worksheet in self.workbook.worksheets:
@@ -1052,6 +1059,7 @@ class IntegrationTests(unittest.TestCase):
 
     def test_lock_upgrade_preserves_the_existing_trade_history(self):
         source = Path(__file__).resolve().parents[1] / "交易管理系统.xlsx"
+        original_source = source.read_bytes()
         source_values = load_workbook(source, data_only=False)
         with tempfile.TemporaryDirectory() as temporary:
             destination = Path(temporary) / "交易管理系统_V2_连续亏损锁仓.xlsx"
@@ -1076,7 +1084,7 @@ class IntegrationTests(unittest.TestCase):
                 upgraded["账户数据"]["A23"].value,
                 "连续亏损锁仓状态",
             )
-            self.assertIsNone(source_values["账户数据"]["A23"].value)
+            self.assertEqual(source.read_bytes(), original_source)
 
     def test_dynamic_stop_upgrade_preserves_history_and_syncs_future_sales(self):
         source = (
@@ -1268,7 +1276,11 @@ class IntegrationTests(unittest.TestCase):
                 if isinstance(cell.value, str) and cell.value.startswith("=")
             ]
             self.assertFalse(
-                any("MAXIFS(" in formula or "MINIFS(" in formula for formula in formulas)
+                any(
+                    token in formula
+                    for formula in formulas
+                    for token in ("MAXIFS(", "MINIFS(", "AGGREGATE(")
+                )
             )
 
     def _recalculate_with_libreoffice(self, source: Path, output_dir: Path) -> Path:
