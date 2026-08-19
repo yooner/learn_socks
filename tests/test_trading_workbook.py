@@ -36,17 +36,17 @@ TRADE_HEADERS = [
     "股票代码",
     "买入时账户金额",
     "本次允许亏损比例",
-    "买入价",
+    "第一批买入价",
     "买入建议股数",
     "开仓风险告警",
-    "实际买入股数",
-    "买入日期",
+    "第一批买入股数",
+    "首次买入日期",
     "期望卖出价",
     "实际卖出价",
     "卖出股数",
     "卖出日期",
     "止损价",
-    "买入费用",
+    "买入总费用",
     "卖出费用",
     "买入价的由来",
     "止损价的由来",
@@ -731,7 +731,97 @@ class WorkbookStructureTests(unittest.TestCase):
         self.assertIn('AG2<>""', share_validations[0].formula1)
         self.assertIn('AH2<>""', share_validations[0].formula1)
         self.assertIn('AI2<>""', share_validations[0].formula1)
-        self.assertEqual(next(iter(trade.tables.values())).ref, "A1:AJ201")
+        self.assertEqual(next(iter(trade.tables.values())).ref, "A1:AR201")
+
+    def test_three_tranche_columns_and_formulas_use_cumulative_position(self):
+        trade = self.workbook["单次交易"]
+
+        self.assertEqual(trade["E1"].value, "第一批买入价")
+        self.assertEqual(trade["H1"].value, "第一批买入股数")
+        self.assertEqual(trade["I1"].value, "首次买入日期")
+        self.assertEqual(trade["O1"].value, "买入总费用")
+        self.assertEqual(
+            [trade.cell(1, column).value for column in range(37, 45)],
+            [
+                "第二批买入价",
+                "第二批买入股数",
+                "第三批买入价",
+                "第三批买入股数",
+                "实际加权买入价",
+                "累计买入股数",
+                "当前持仓风险",
+                "分仓规则检查",
+            ],
+        )
+        self.assertIn("E2*H2", trade["AO2"].value)
+        self.assertIn("AK2*AL2", trade["AO2"].value)
+        self.assertIn("AM2*AN2", trade["AO2"].value)
+        self.assertIn("H2+IF(AL2", trade["AP2"].value)
+        self.assertIn("MAXIFS", trade["AQ2"].value)
+        self.assertIn(
+            "'持仓跟踪'!$S$2:$S$501",
+            trade["AQ2"].value,
+        )
+        self.assertIn("违规：超过单笔风险上限", trade["AR2"].value)
+        self.assertIn("违规：超过账户风险上限", trade["AR2"].value)
+        self.assertIn("AO2", trade["U2"].value)
+        self.assertIn("AO2", trade["V2"].value)
+        self.assertIn("AK2*AL2", trade["X2"].value)
+        self.assertIn("AM2*AN2", trade["X2"].value)
+        self.assertIn("AK2*AL2", trade["Y2"].value)
+        self.assertEqual(next(iter(trade.tables.values())).ref, "A1:AR201")
+
+    def test_tranche_validations_enforce_entry_order_lock_and_risk(self):
+        trade = self.workbook["单次交易"]
+        validations = trade.data_validations.dataValidation
+        first_shares = next(
+            item for item in validations if "H2:H201" in str(item.sqref)
+        )
+        second_price = next(
+            item for item in validations if "AK2:AK201" in str(item.sqref)
+        )
+        second_shares = next(
+            item for item in validations if "AL2:AL201" in str(item.sqref)
+        )
+        third_price = next(
+            item for item in validations if "AM2:AM201" in str(item.sqref)
+        )
+        third_shares = next(
+            item for item in validations if "AN2:AN201" in str(item.sqref)
+        )
+
+        self.assertIn("AQ2<=C2*D2", first_shares.formula1)
+        self.assertIn(
+            "SUM($AQ$2:$AQ$201)<=_AccountRiskLimit",
+            first_shares.formula1,
+        )
+        self.assertIn("ISNUMBER(AK2)", second_price.formula1)
+        self.assertIn('AK2<>""', second_shares.formula1)
+        self.assertIn("MOD(AL2,100)=0", second_shares.formula1)
+        self.assertIn("_LockStatus", second_shares.formula1)
+        self.assertIn("AQ2<=C2*D2", second_shares.formula1)
+        self.assertIn(
+            "SUM($AQ$2:$AQ$201)<=_AccountRiskLimit",
+            second_shares.formula1,
+        )
+        self.assertIn('AND(AK2<>"",AL2<>"")', third_price.formula1)
+        self.assertIn('AM2<>""', third_shares.formula1)
+        self.assertIn("MOD(AN2,100)=0", third_shares.formula1)
+        self.assertTrue(second_shares.showErrorMessage)
+        self.assertTrue(third_shares.showErrorMessage)
+        self.assertIn("_AccountRiskLimit", self.workbook.defined_names)
+
+    def test_tracking_full_sale_uses_cumulative_shares(self):
+        tracking = self.workbook["持仓跟踪"]
+
+        self.assertIn(
+            "'单次交易'!$AP$2:$AP$201",
+            tracking["Z2"].value,
+        )
+        self.assertNotIn(
+            "'单次交易'!$H$2:$H$201",
+            tracking["Z2"].value,
+        )
 
     def test_trade_sheet_contains_required_headers_and_guarded_formulas(self):
         ws = self.workbook["单次交易"]
@@ -752,7 +842,7 @@ class WorkbookStructureTests(unittest.TestCase):
         self.assertIn("E2*H2", ws["X2"].value)
         self.assertNotIn("E2*F2", ws["X2"].value)
         self.assertNotIn("{row}", ws["X2"].value)
-        self.assertIn('IF(OR(X2="",E2="",H2=""),"",IF(', ws["Y2"].value)
+        self.assertIn('IF(OR(X2="",AP2=""),"",IF(', ws["Y2"].value)
         self.assertIn('OR(A2=""', ws["AB2"].value)
         self.assertIn("'多次统计数据'!$B$8", ws["AB2"].value)
         self.assertIn("'多次统计数据'!$B$9", ws["AC2"].value)
@@ -819,8 +909,8 @@ class WorkbookStructureTests(unittest.TestCase):
             "PRODUCT(1+'单次交易'!AE2:AE201)",
             stats["B14"].value,
         )
-        self.assertIn("'单次交易'!E2:E201", stats["B12"].value)
-        self.assertIn("'单次交易'!H2:H201", stats["B12"].value)
+        self.assertIn("'单次交易'!AO2:AO201", stats["B12"].value)
+        self.assertIn("'单次交易'!AP2:AP201", stats["B12"].value)
         self.assertNotIn("'单次交易'!F2:F201", stats["B12"].value)
         self.assertIn("SUM('单次交易'!X2:X201)", account["B3"].value)
         self.assertIn("SUMIFS", account["B8"].value)
@@ -829,8 +919,8 @@ class WorkbookStructureTests(unittest.TestCase):
         self.assertEqual(account["A7"].value, "当月允许最大亏损金额")
         self.assertEqual(account["A9"].value, "当前未平仓理论亏损")
         self.assertEqual(account["A10"].value, "当月剩余可开仓风险额度")
-        self.assertIn("SUMPRODUCT", account["B9"].value)
-        self.assertIn("'单次交易'!H2:H201", account["B9"].value)
+        self.assertIn("SUM", account["B9"].value)
+        self.assertIn("'单次交易'!AQ2:AQ201", account["B9"].value)
         self.assertEqual(
             account["B10"].value,
             '=IF(OR(B7="",B9=""),"",B7-B9)',

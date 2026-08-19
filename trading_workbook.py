@@ -27,17 +27,17 @@ TRADE_HEADERS = [
     "股票代码",
     "买入时账户金额",
     "本次允许亏损比例",
-    "买入价",
+    "第一批买入价",
     "买入建议股数",
     "开仓风险告警",
-    "实际买入股数",
-    "买入日期",
+    "第一批买入股数",
+    "首次买入日期",
     "期望卖出价",
     "实际卖出价",
     "卖出股数",
     "卖出日期",
     "止损价",
-    "买入费用",
+    "买入总费用",
     "卖出费用",
     "买入价的由来",
     "止损价的由来",
@@ -113,6 +113,17 @@ EXPECTATION_PERIOD_MATCHES = {
     "突破冲新高": {"4～10个交易日", "11～20个交易日"},
     "趋势波段": {"11～20个交易日", "21～60个交易日", "60个交易日以上"},
 }
+
+THREE_TRANCHE_HEADERS = (
+    "第二批买入价",
+    "第二批买入股数",
+    "第三批买入价",
+    "第三批买入股数",
+    "实际加权买入价",
+    "累计买入股数",
+    "当前持仓风险",
+    "分仓规则检查",
+)
 
 
 def calculate_tranche_position(
@@ -2270,6 +2281,315 @@ def apply_trade_expectation_fields(
     return wb
 
 
+def _effective_stop_formula(row: int, tracking_end_row: int = 501) -> str:
+    return (
+        f"MAX(N{row},IFERROR(MAXIFS('持仓跟踪'!$S$2:$S${tracking_end_row},"
+        f"'持仓跟踪'!$A$2:$A${tracking_end_row},\"每日跟踪\","
+        f"'持仓跟踪'!$B$2:$B${tracking_end_row},A{row}),0))"
+    )
+
+
+def _three_tranche_formulas(
+    row: int,
+    trade_end_row: int = 201,
+) -> dict[int, str]:
+    effective_stop = _effective_stop_formula(row)
+    buy_amount = (
+        f"E{row}*H{row}+IF(AND(AK{row}<>\"\",AL{row}<>\"\"),"
+        f"AK{row}*AL{row},0)+IF(AND(AM{row}<>\"\",AN{row}<>\"\"),"
+        f"AM{row}*AN{row},0)"
+    )
+    position_risk = (
+        f"MAX(E{row}-{effective_stop},0)*H{row}+"
+        f"IF(OR(AK{row}=\"\",AL{row}=\"\"),0,"
+        f"MAX(AK{row}-{effective_stop},0)*AL{row})+"
+        f"IF(OR(AM{row}=\"\",AN{row}=\"\"),0,"
+        f"MAX(AM{row}-{effective_stop},0)*AN{row})"
+    )
+    second_pair_invalid = (
+        f"OR(AND(AK{row}=\"\",AL{row}<>\"\"),"
+        f"AND(AK{row}<>\"\",AL{row}=\"\"))"
+    )
+    third_pair_invalid = (
+        f"OR(AND(AM{row}=\"\",AN{row}<>\"\"),"
+        f"AND(AM{row}<>\"\",AN{row}=\"\"))"
+    )
+    lot_invalid = (
+        f"OR(H{row}<=0,H{row}<>INT(H{row}),MOD(H{row},100)<>0,"
+        f"AND(AL{row}<>\"\",OR(AL{row}<=0,AL{row}<>INT(AL{row}),"
+        f"MOD(AL{row},100)<>0)),"
+        f"AND(AN{row}<>\"\",OR(AN{row}<=0,AN{row}<>INT(AN{row}),"
+        f"MOD(AN{row},100)<>0)))"
+    )
+    rule_check = (
+        f'=IF(A{row}="","",IF(OR(E{row}="",H{row}=""),'
+        f'"违规：第一批价格或股数缺失",IF({second_pair_invalid},'
+        f'"违规：第二批价格与股数须成对填写",IF({third_pair_invalid},'
+        f'"违规：第三批价格与股数须成对填写",IF('
+        f'AND(OR(AM{row}<>"",AN{row}<>""),'
+        f'OR(AK{row}="",AL{row}="")),"违规：必须先完成第二批",'
+        f'IF({lot_invalid},"违规：股数须为100股整数倍",IF('
+        f'AND(OR(AL{row}<>"",AN{row}<>""),'
+        'OR(_LockStatus="已锁仓",_LockStatus="解锁信息不完整")),'
+        f'"违规：锁仓期间禁止加仓",IF(AQ{row}>C{row}*D{row},'
+        f'"违规：超过单笔风险上限",IF(SUM($AQ$2:$AQ${trade_end_row})>'
+        "'账户数据'!$B$7,\"违规：超过账户风险上限\",\"通过\"))))))))))"
+    )
+    return {
+        41: (
+            f'=IF(OR(A{row}="",H{row}="",H{row}<=0),"",'
+            f'({buy_amount})/AP{row})'
+        ),
+        42: (
+            f'=IF(OR(A{row}="",H{row}="",H{row}<=0),"",'
+            f'H{row}+IF(AL{row}="",0,AL{row})+'
+            f'IF(AN{row}="",0,AN{row}))'
+        ),
+        43: (
+            f'=IF(A{row}="","",IF(M{row}<>"",0,'
+            f'IF(OR(H{row}="",N{row}=""),"",{position_risk})))'
+        ),
+        44: rule_check,
+    }
+
+
+def apply_three_tranche_buying(
+    wb: Workbook,
+    trade_end_row: int = 201,
+) -> Workbook:
+    """Extend a V4 workbook with three fixed buy batches."""
+    trade = wb["单次交易"]
+    if trade["AK1"].value not in (None, ""):
+        raise ValueError("分仓字段已存在；为避免覆盖数据，不重复创建")
+
+    renamed_headers = {
+        "E1": "第一批买入价",
+        "H1": "第一批买入股数",
+        "I1": "首次买入日期",
+        "O1": "买入总费用",
+    }
+    for coordinate, header in renamed_headers.items():
+        trade[coordinate] = header
+
+    for column, header in enumerate(THREE_TRANCHE_HEADERS, start=37):
+        cell = trade.cell(1, column)
+        cell.value = header
+        cell.fill = HEADER_FILL
+        cell.font = HEADER_FONT
+        cell.alignment = Alignment(
+            horizontal="center",
+            vertical="center",
+            wrap_text=True,
+        )
+        cell.border = THIN_BORDER
+
+    for row in range(2, trade_end_row + 1):
+        formulas = _three_tranche_formulas(row, trade_end_row)
+        for column in range(37, 45):
+            cell = trade.cell(row, column)
+            if column in formulas:
+                cell.value = formulas[column]
+            cell.fill = INPUT_FILL if column <= 40 else FORMULA_FILL
+            cell.border = THIN_BORDER
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+        for column in (37, 39, 41, 43):
+            trade.cell(row, column).number_format = CURRENCY_FORMAT
+        for column in (38, 40, 42):
+            trade.cell(row, column).number_format = "0"
+
+        buy_amount = (
+            f'E{row}*H{row}+IF(AND(AK{row}<>"",AL{row}<>""),'
+            f'AK{row}*AL{row},0)+IF(AND(AM{row}<>"",AN{row}<>""),'
+            f'AM{row}*AN{row},0)'
+        )
+        trade.cell(row, 21).value = (
+            f'=IF(OR(AO{row}="",J{row}="",AO{row}<=0),"",'
+            f'(J{row}-AO{row})/AO{row})'
+        )
+        trade.cell(row, 22).value = (
+            f'=IF(OR(AO{row}="",N{row}="",AO{row}<=0),"",'
+            f'(AO{row}-N{row})/AO{row})'
+        )
+        trade.cell(row, 24).value = (
+            f'=IF(OR(K{row}="",L{row}="",AP{row}=""),"",'
+            f'K{row}*L{row}-({buy_amount})-IF(O{row}="",0,O{row})'
+            f'-IF(P{row}="",0,P{row}))'
+        )
+        trade.cell(row, 25).value = (
+            f'=IF(OR(X{row}="",AP{row}=""),"",IF('
+            f'({buy_amount})+IF(O{row}="",0,O{row})<=0,"",'
+            f'X{row}/(({buy_amount})+IF(O{row}="",0,O{row}))))'
+        )
+
+    for column, width in {
+        "AK": 16,
+        "AL": 18,
+        "AM": 16,
+        "AN": 18,
+        "AO": 18,
+        "AP": 18,
+        "AQ": 18,
+        "AR": 28,
+    }.items():
+        trade.column_dimensions[column].width = width
+
+    account = wb["账户数据"]
+    account["B9"] = "=IFERROR(SUM('单次交易'!AQ2:AQ201),0)"
+    account["C9"] = "未平仓三批持仓按当前有效止损计算的风险合计"
+    statistics = wb["多次统计数据"]
+    statistics["B12"] = (
+        "=IFERROR(SUMPRODUCT('单次交易'!AO2:AO201,"
+        "'单次交易'!AP2:AP201)/COUNT('单次交易'!AP2:AP201),\"\")"
+    )
+    statistics["C12"] = "实际加权买入价×累计买入股数的平均值，包含未卖出交易"
+
+    if "_AccountRiskLimit" in wb.defined_names:
+        del wb.defined_names["_AccountRiskLimit"]
+    wb.defined_names.add(
+        DefinedName(
+            "_AccountRiskLimit",
+            attr_text="'账户数据'!$B$7",
+        )
+    )
+
+    trade.data_validations.dataValidation = [
+        validation
+        for validation in trade.data_validations.dataValidation
+        if f"H2:H{trade_end_row}" not in str(validation.sqref)
+    ]
+    first_shares = DataValidation(
+        type="custom",
+        formula1=(
+            '=OR(H2="",AND(_LockStatus<>"已锁仓",'
+            '_LockStatus<>"解锁信息不完整",AG2<>"",AH2<>"",AI2<>"",'
+            'COUNTIFS(_TrackType,"止损计划",_TrackTradeId,A2,'
+            '_TrackRule,"计划有效")>0,ISNUMBER(H2),H2>0,'
+            'H2=INT(H2),MOD(H2,100)=0,AQ2<=C2*D2,'
+            'SUM($AQ$2:$AQ$201)<=_AccountRiskLimit))'
+        ),
+        allow_blank=True,
+    )
+    first_shares.errorTitle = "当前禁止开仓、计划不完整或风险超限"
+    first_shares.error = (
+        "请完成解锁、止损计划和交易预期，确保股数为100股整数倍，"
+        "且单笔及账户风险均未超过上限"
+    )
+    first_shares.showErrorMessage = True
+    _add_validation(trade, first_shares, f"H2:H{trade_end_row}")
+
+    second_price = DataValidation(
+        type="custom",
+        formula1='=OR(AK2="",AND(ISNUMBER(AK2),AK2>0))',
+        allow_blank=True,
+    )
+    second_price.errorTitle = "第二批买入价无效"
+    second_price.error = "请填写大于0的价格；删除分仓时先删除股数"
+    second_price.showErrorMessage = True
+    _add_validation(trade, second_price, f"AK2:AK{trade_end_row}")
+
+    second_shares = DataValidation(
+        type="custom",
+        formula1=(
+            '=OR(AL2="",AND(AK2<>"",ISNUMBER(AL2),AL2>0,'
+            'AL2=INT(AL2),MOD(AL2,100)=0,_LockStatus<>"已锁仓",'
+            '_LockStatus<>"解锁信息不完整",AQ2<=C2*D2,'
+            'SUM($AQ$2:$AQ$201)<=_AccountRiskLimit))'
+        ),
+        allow_blank=True,
+    )
+    second_shares.errorTitle = "第二批加仓被阻止"
+    second_shares.error = (
+        "请先填写第二批价格并确认已解锁；股数必须为100股整数倍，"
+        "且加仓后不能超过单笔或账户风险上限"
+    )
+    second_shares.showErrorMessage = True
+    _add_validation(trade, second_shares, f"AL2:AL{trade_end_row}")
+
+    third_price = DataValidation(
+        type="custom",
+        formula1=(
+            '=OR(AM2="",AND(ISNUMBER(AM2),AM2>0,'
+            'AND(AK2<>"",AL2<>"")))'
+        ),
+        allow_blank=True,
+    )
+    third_price.errorTitle = "第三批买入价无效"
+    third_price.error = "请先完整填写第二批，再填写大于0的第三批价格"
+    third_price.showErrorMessage = True
+    _add_validation(trade, third_price, f"AM2:AM{trade_end_row}")
+
+    third_shares = DataValidation(
+        type="custom",
+        formula1=(
+            '=OR(AN2="",AND(AK2<>"",AL2<>"",AM2<>"",'
+            'ISNUMBER(AN2),AN2>0,AN2=INT(AN2),MOD(AN2,100)=0,'
+            '_LockStatus<>"已锁仓",_LockStatus<>"解锁信息不完整",'
+            'AQ2<=C2*D2,SUM($AQ$2:$AQ$201)<=_AccountRiskLimit))'
+        ),
+        allow_blank=True,
+    )
+    third_shares.errorTitle = "第三批加仓被阻止"
+    third_shares.error = (
+        "请先完整填写前两批并确认已解锁；股数必须为100股整数倍，"
+        "且加仓后不能超过单笔或账户风险上限"
+    )
+    third_shares.showErrorMessage = True
+    _add_validation(trade, third_shares, f"AN2:AN{trade_end_row}")
+
+    trade.conditional_formatting.add(
+        f"AR2:AR{trade_end_row}",
+        FormulaRule(formula=['LEFT($AR2,2)="违规"'], fill=RED_FILL),
+    )
+    trade.conditional_formatting.add(
+        f"AR2:AR{trade_end_row}",
+        FormulaRule(formula=['$AR2="通过"'], fill=GREEN_FILL),
+    )
+    trade["AK1"].comment = Comment(
+        "需要第二批时先填价格，再填股数；股数录入时会检查锁仓和风险上限。",
+        "Codex",
+    )
+    trade["AM1"].comment = Comment(
+        "第三批必须在第二批完整后填写，同样采用先价格、后股数。",
+        "Codex",
+    )
+    trade["AR1"].comment = Comment(
+        "持续审计价格股数配对、批次顺序、整手、锁仓及风险上限；"
+        "粘贴绕过验证时仍会显示违规。",
+        "Codex",
+    )
+
+    tracking = wb["持仓跟踪"]
+    tracking_end_row = max(tracking.max_row, 501)
+    for row in range(2, tracking_end_row + 1):
+        tracking.cell(row, 26).value = (
+            f'=IF(X{row}<>"执行卖出","",IFERROR(LOOKUP(2,1/'
+            f"('单次交易'!$A$2:$A$201=B{row}),"
+            "'单次交易'!$AP$2:$AP$201),\"\"))"
+        )
+    trade["L1"].comment = Comment(
+        "卖出股数由“持仓跟踪”同步，按累计买入股数一次性全部卖出。",
+        "Codex",
+    )
+
+    table = next(iter(trade.tables.values()))
+    existing_column_count = len(table.tableColumns)
+    for column in range(existing_column_count + 1, 45):
+        table.tableColumns.append(
+            TableColumn(id=column, name=str(trade.cell(1, column).value))
+        )
+    for column, table_column in enumerate(table.tableColumns, start=1):
+        table_column.name = str(trade.cell(1, column).value)
+    table.ref = f"A1:AR{trade_end_row}"
+    if table.autoFilter is not None:
+        table.autoFilter.ref = table.ref
+
+    wb.active = wb.sheetnames.index("单次交易")
+    wb.calculation.calcMode = "auto"
+    wb.calculation.fullCalcOnLoad = True
+    wb.calculation.forceFullCalc = True
+    return wb
+
+
 def upgrade_workbook_with_trade_expectations(
     source: str | Path,
     destination: str | Path,
@@ -2299,6 +2619,7 @@ def build_workbook(
     apply_consecutive_loss_lock(wb)
     apply_dynamic_stop_tracking(wb)
     apply_trade_expectation_fields(wb)
+    apply_three_tranche_buying(wb)
     wb.calculation.calcMode = "auto"
     wb.calculation.fullCalcOnLoad = True
     wb.calculation.forceFullCalc = True
