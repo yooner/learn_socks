@@ -1062,6 +1062,78 @@ def _build_reason_sheet(wb: Workbook, end_row: int = 501):
 def _tracking_row_formulas(row: int, end_row: int) -> dict[int, str]:
     daily = "每日跟踪"
     plan = "止损计划"
+    history_high = _aggregate_extreme_formula(
+        14,
+        f"$I$2:$I${end_row}",
+        (
+            f'$A$2:$A${end_row}="{daily}"',
+            f"$B$2:$B${end_row}=B{row}",
+            f"$H$2:$H${end_row}<=H{row}",
+        ),
+    )
+    activated_stage = _aggregate_extreme_formula(
+        14,
+        f"$D$2:$D${end_row}",
+        (
+            f'$A$2:$A${end_row}="{plan}"',
+            f"$B$2:$B${end_row}=B{row}",
+            f"$E$2:$E${end_row}<=O{row}",
+        ),
+    )
+    activated_stop = _aggregate_extreme_formula(
+        14,
+        f"$F$2:$F${end_row}",
+        (
+            f'$A$2:$A${end_row}="{plan}"',
+            f"$B$2:$B${end_row}=B{row}",
+            f"$E$2:$E${end_row}<=O{row}",
+        ),
+    )
+    raised_stop = _aggregate_extreme_formula(
+        14,
+        f"$R$2:$R${end_row}",
+        (
+            f'$A$2:$A${end_row}="{daily}"',
+            f"$B$2:$B${end_row}=B{row}",
+            f"$H$2:$H${end_row}<=H{row}",
+        ),
+    )
+    next_activation = _aggregate_extreme_formula(
+        15,
+        f"$E$2:$E${end_row}",
+        (
+            f'$A$2:$A${end_row}="{plan}"',
+            f"$B$2:$B${end_row}=B{row}",
+            f"$E$2:$E${end_row}>O{row}",
+        ),
+    )
+    next_stop = _aggregate_extreme_formula(
+        14,
+        f"$F$2:$F${end_row}",
+        (
+            f'$A$2:$A${end_row}="{plan}"',
+            f"$B$2:$B${end_row}=B{row}",
+            f"$E$2:$E${end_row}=T{row}",
+        ),
+    )
+    prior_activation = _aggregate_extreme_formula(
+        14,
+        f"$E$2:$E${end_row}",
+        (
+            f'$A$2:$A${end_row}="{plan}"',
+            f"$B$2:$B${end_row}=B{row}",
+            f"$D$2:$D${end_row}<D{row}",
+        ),
+    )
+    prior_stop = _aggregate_extreme_formula(
+        14,
+        f"$F$2:$F${end_row}",
+        (
+            f'$A$2:$A${end_row}="{plan}"',
+            f"$B$2:$B${end_row}=B{row}",
+            f"$D$2:$D${end_row}<D{row}",
+        ),
+    )
     formulas = {
         3: (
             f'=IF(B{row}="","",IFERROR(LOOKUP(2,1/'
@@ -1075,35 +1147,29 @@ def _tracking_row_formulas(row: int, end_row: int) -> dict[int, str]:
         ),
         15: (
             f'=IF(A{row}<>"{daily}","",IF(OR(B{row}="",H{row}="",I{row}=""),"",'
-            f'MAXIFS($I$2:$I${end_row},$A$2:$A${end_row},"{daily}",'
-            f'$B$2:$B${end_row},B{row},$H$2:$H${end_row},"<="&H{row})))'
+            f'IFERROR({history_high},"")))'
         ),
         16: (
             f'=IF(A{row}<>"{daily}","",IF(O{row}="","",IFERROR('
-            f'MAXIFS($D$2:$D${end_row},$A$2:$A${end_row},"{plan}",'
-            f'$B$2:$B${end_row},B{row},$E$2:$E${end_row},"<="&O{row}),0)))'
+            f'{activated_stage},0)))'
         ),
         17: (
             f'=IF(A{row}<>"{daily}","",IF(N{row}="","",MAX(N{row},IFERROR('
-            f'MAXIFS($F$2:$F${end_row},$A$2:$A${end_row},"{plan}",'
-            f'$B$2:$B${end_row},B{row},$E$2:$E${end_row},"<="&O{row}),0))))'
+            f'{activated_stop},0))))'
         ),
         19: (
             f'=IF(A{row}<>"{daily}","",IF(Q{row}="","",MAX(Q{row},IFERROR('
-            f'MAXIFS($R$2:$R${end_row},$A$2:$A${end_row},"{daily}",'
-            f'$B$2:$B${end_row},B{row},$H$2:$H${end_row},"<="&H{row}),0))))'
+            f'{raised_stop},0))))'
         ),
         20: (
             f'=IF(A{row}<>"{daily}","",IF(O{row}="","",IF('
             f'COUNTIFS($A$2:$A${end_row},"{plan}",$B$2:$B${end_row},B{row},'
             f'$E$2:$E${end_row},">"&O{row})=0,"",'
-            f'MINIFS($E$2:$E${end_row},$A$2:$A${end_row},"{plan}",'
-            f'$B$2:$B${end_row},B{row},$E$2:$E${end_row},">"&O{row}))))'
+            f'{next_activation})))'
         ),
         21: (
             f'=IF(OR(A{row}<>"{daily}",T{row}=""),"",IFERROR('
-            f'MAXIFS($F$2:$F${end_row},$A$2:$A${end_row},"{plan}",'
-            f'$B$2:$B${end_row},B{row},$E$2:$E${end_row},T{row}),""))'
+            f'{next_stop},""))'
         ),
         22: (
             f'=IF(OR(A{row}<>"{daily}",T{row}="",I{row}="",I{row}<=0),"",'
@@ -1139,10 +1205,7 @@ def _tracking_row_formulas(row: int, end_row: int) -> dict[int, str]:
         f'IF(F{row}>E{row},"止损价不得高于激活价",'
         f'IF(AND(COUNTIFS($A$2:$A${end_row},"{plan}",$B$2:$B${end_row},B{row},'
         f'$D$2:$D${end_row},"<"&D{row})>0,OR('
-        f'E{row}<=MAXIFS($E$2:$E${end_row},$A$2:$A${end_row},"{plan}",'
-        f'$B$2:$B${end_row},B{row},$D$2:$D${end_row},"<"&D{row}),'
-        f'F{row}<MAXIFS($F$2:$F${end_row},$A$2:$A${end_row},"{plan}",'
-        f'$B$2:$B${end_row},B{row},$D$2:$D${end_row},"<"&D{row}))),'
+        f'E{row}<={prior_activation},F{row}<{prior_stop})),'
         '"阶段价格必须逐级提高","计划有效")))))))'
     )
     daily_check = (
@@ -2037,6 +2100,19 @@ def _tracking_sell_lookup_formula(
     )
 
 
+def _aggregate_extreme_formula(
+    function_number: int,
+    value_range: str,
+    criteria: Iterable[str],
+) -> str:
+    """Build an Excel 2016/WPS-compatible conditional MIN/MAX formula."""
+    condition_product = "*".join(f"({criterion})" for criterion in criteria)
+    return (
+        f"AGGREGATE({function_number},6,{value_range}/"
+        f"({condition_product}),1)"
+    )
+
+
 def apply_dynamic_stop_tracking(
     wb: Workbook,
     tracking_end_row: int = 501,
@@ -2297,11 +2373,15 @@ def apply_trade_expectation_fields(
 
 
 def _effective_stop_formula(row: int, tracking_end_row: int = 501) -> str:
-    return (
-        f"MAX(N{row},IFERROR(MAXIFS('持仓跟踪'!$S$2:$S${tracking_end_row},"
-        f"'持仓跟踪'!$A$2:$A${tracking_end_row},\"每日跟踪\","
-        f"'持仓跟踪'!$B$2:$B${tracking_end_row},A{row}),0))"
+    tracked_stop = _aggregate_extreme_formula(
+        14,
+        f"'持仓跟踪'!$S$2:$S${tracking_end_row}",
+        (
+            f"'持仓跟踪'!$A$2:$A${tracking_end_row}=\"每日跟踪\"",
+            f"'持仓跟踪'!$B$2:$B${tracking_end_row}=A{row}",
+        ),
     )
+    return f"MAX(N{row},IFERROR({tracked_stop},0))"
 
 
 def _three_tranche_formulas(
@@ -2627,6 +2707,46 @@ def upgrade_workbook_with_three_tranche_buying(
     destination_path = Path(destination)
     workbook = load_workbook(source_path, data_only=False)
     apply_three_tranche_buying(workbook)
+    workbook.save(destination_path)
+    return destination_path
+
+
+def apply_excel2016_wps_compatibility(
+    wb: Workbook,
+    tracking_end_row: int = 501,
+    trade_end_row: int = 201,
+) -> Workbook:
+    """Replace unsupported conditional aggregate formulas without data loss."""
+    tracking = wb["持仓跟踪"]
+    compatibility_columns = (15, 16, 17, 19, 20, 21, 29)
+    for row in range(2, tracking_end_row + 1):
+        formulas = _tracking_row_formulas(row, tracking_end_row)
+        for column in compatibility_columns:
+            tracking.cell(row, column).value = formulas[column]
+
+    trade = wb["单次交易"]
+    if trade["AQ1"].value == "当前持仓风险":
+        for row in range(2, trade_end_row + 1):
+            trade.cell(row, 43).value = _three_tranche_formulas(
+                row,
+                trade_end_row,
+            )[43]
+
+    wb.calculation.calcMode = "auto"
+    wb.calculation.fullCalcOnLoad = True
+    wb.calculation.forceFullCalc = True
+    return wb
+
+
+def upgrade_workbook_for_excel2016_wps(
+    source: str | Path,
+    destination: str | Path,
+) -> Path:
+    """Preserve an existing V5 workbook and make its formulas compatible."""
+    source_path = Path(source)
+    destination_path = Path(destination)
+    workbook = load_workbook(source_path, data_only=False)
+    apply_excel2016_wps_compatibility(workbook)
     workbook.save(destination_path)
     return destination_path
 

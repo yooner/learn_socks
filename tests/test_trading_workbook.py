@@ -732,9 +732,9 @@ class WorkbookStructureTests(unittest.TestCase):
             expected_headers,
         )
         self.assertEqual(tracking.freeze_panes, "D2")
-        self.assertIn("MAXIFS", tracking["O2"].value)
-        self.assertIn("MAXIFS", tracking["Q2"].value)
-        self.assertIn("MAXIFS", tracking["S2"].value)
+        self.assertIn("AGGREGATE(14,6", tracking["O2"].value)
+        self.assertIn("AGGREGATE(14,6", tracking["Q2"].value)
+        self.assertIn("AGGREGATE(14,6", tracking["S2"].value)
         self.assertIn('"触发止损：应全部卖出"', tracking["W2"].value)
         self.assertIn('"执行卖出"', tracking["AB2"].value)
         self.assertIn("计划有效", tracking["AC2"].value)
@@ -807,7 +807,7 @@ class WorkbookStructureTests(unittest.TestCase):
         self.assertIn("AK2*AL2", trade["AO2"].value)
         self.assertIn("AM2*AN2", trade["AO2"].value)
         self.assertIn("H2+IF(AL2", trade["AP2"].value)
-        self.assertIn("MAXIFS", trade["AQ2"].value)
+        self.assertIn("AGGREGATE(14,6", trade["AQ2"].value)
         self.assertIn(
             "'持仓跟踪'!$S$2:$S$501",
             trade["AQ2"].value,
@@ -829,6 +829,22 @@ class WorkbookStructureTests(unittest.TestCase):
                 formula = trade[coordinate].value
                 self.assertEqual(formula.count("("), formula.count(")"))
                 self.assertTrue(Tokenizer(formula).items)
+
+    def test_workbook_formulas_support_excel_2016_and_wps(self):
+        unsupported = ("MAXIFS(", "MINIFS(", "LET(", "XLOOKUP(", "FILTER(")
+        incompatible_cells = []
+
+        for worksheet in self.workbook.worksheets:
+            for row in worksheet.iter_rows():
+                for cell in row:
+                    formula = cell.value
+                    if not isinstance(formula, str) or not formula.startswith("="):
+                        continue
+                    if any(name in formula.upper() for name in unsupported):
+                        incompatible_cells.append(
+                            f"{worksheet.title}!{cell.coordinate}"
+                        )
+        self.assertEqual(incompatible_cells, [])
 
     def test_tranche_validations_enforce_entry_order_lock_and_risk(self):
         trade = self.workbook["单次交易"]
@@ -1210,6 +1226,50 @@ class IntegrationTests(unittest.TestCase):
             )
             self.assertEqual(after.active.title, "单次交易")
             self.assertEqual(after.sheetnames, before.sheetnames)
+
+    def test_excel2016_wps_upgrade_preserves_entered_stop_plan(self):
+        source_workbook = load_workbook(
+            Path(__file__).resolve().parents[1]
+            / "交易管理系统_V5_三批买入.xlsx",
+            data_only=False,
+        )
+        tracking = source_workbook["持仓跟踪"]
+        entered = {
+            1: "止损计划",
+            2: 102,
+            4: 1,
+            5: 3.50,
+            6: 3.00,
+            7: "突破无力，在3~4块之间震荡",
+        }
+        for column, value in entered.items():
+            tracking.cell(102, column).value = value
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "现有V5.xlsx"
+            destination = root / "兼容版.xlsx"
+            source_workbook.save(source)
+
+            tw.upgrade_workbook_for_excel2016_wps(source, destination)
+
+            compatible = load_workbook(destination, data_only=False)
+            compatible_tracking = compatible["持仓跟踪"]
+            for column, expected in entered.items():
+                self.assertEqual(
+                    compatible_tracking.cell(102, column).value,
+                    expected,
+                )
+            formulas = [
+                cell.value.upper()
+                for worksheet in compatible.worksheets
+                for row in worksheet.iter_rows()
+                for cell in row
+                if isinstance(cell.value, str) and cell.value.startswith("=")
+            ]
+            self.assertFalse(
+                any("MAXIFS(" in formula or "MINIFS(" in formula for formula in formulas)
+            )
 
     def _recalculate_with_libreoffice(self, source: Path, output_dir: Path) -> Path:
         soffice = shutil.which("soffice")
