@@ -8,6 +8,7 @@ from datetime import date
 from pathlib import Path
 
 from openpyxl import load_workbook
+from openpyxl.formula import Tokenizer
 import trading_workbook as tw
 from trading_workbook import (
     calculate_account_return,
@@ -819,6 +820,15 @@ class WorkbookStructureTests(unittest.TestCase):
         self.assertIn("AM2*AN2", trade["X2"].value)
         self.assertIn("AK2*AL2", trade["Y2"].value)
         self.assertEqual(next(iter(trade.tables.values())).ref, "A1:AR201")
+
+    def test_three_tranche_formulas_are_syntactically_balanced(self):
+        trade = self.workbook["单次交易"]
+
+        for coordinate in ("AO2", "AP2", "AQ2", "AR2", "X2", "Y2"):
+            with self.subTest(coordinate=coordinate):
+                formula = trade[coordinate].value
+                self.assertEqual(formula.count("("), formula.count(")"))
+                self.assertTrue(Tokenizer(formula).items)
 
     def test_tranche_validations_enforce_entry_order_lock_and_risk(self):
         trade = self.workbook["单次交易"]

@@ -2348,7 +2348,7 @@ def _three_tranche_formulas(
         'OR(_LockStatus="已锁仓",_LockStatus="解锁信息不完整")),'
         f'"违规：锁仓期间禁止加仓",IF(AQ{row}>C{row}*D{row},'
         f'"违规：超过单笔风险上限",IF(SUM($AQ$2:$AQ${trade_end_row})>'
-        "'账户数据'!$B$7,\"违规：超过账户风险上限\",\"通过\"))))))))))"
+        "'账户数据'!$B$7,\"违规：超过账户风险上限\",\"通过\")))))))))"
     )
     return {
         41: (
